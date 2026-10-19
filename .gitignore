@@ -1,0 +1,9 @@
+# 只跟踪根级共享模块；mcp-servers/、startup-intel/、scratch 等各自管理
+/*
+!/.gitignore
+!/README.md
+!/db.py
+!/supabase_client.py
+!/quant_core.py
+!/health.sh
+!/mcp_ping.py
