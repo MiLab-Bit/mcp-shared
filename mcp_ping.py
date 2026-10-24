@@ -5,17 +5,25 @@ mcp_ping.py — 用 MCP streamable-http 协议调用已部署 server，确认 to
 示例:
   python mcp_ping.py 8794                # 列 tools
   python mcp_ping.py 8794 get_stock_daily '{"symbol":"600519.SH"}'
+鉴权 server（如 hermes-crawler）需带 token：
+  MCP_TOKEN=cr_platform_xxx python mcp_ping.py 8790 target_health
 """
+import os
 import sys, json, uuid, urllib.request as ur
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8794"
 BASE = f"http://127.0.0.1:{PORT}/mcp"
+# 已启用 Bearer 鉴权的 server（如 hermes-crawler）：token 走环境变量，不进命令行参数
+TOKEN = os.environ.get("MCP_TOKEN", "")
 
 
 def post(body, headers):
-    req = ur.Request(BASE, data=json.dumps(body).encode(),
-                     headers={"Content-Type": "application/json",
-                              "Accept": "application/json, text/event-stream", **headers})
+    hdrs = {"Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream"}
+    if TOKEN:
+        hdrs["Authorization"] = "Bearer " + TOKEN
+    hdrs.update(headers)
+    req = ur.Request(BASE, data=json.dumps(body).encode(), headers=hdrs)
     with ur.urlopen(req, timeout=40) as r:
         return r.read().decode().strip()
 
