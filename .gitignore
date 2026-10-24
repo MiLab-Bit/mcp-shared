@@ -9,6 +9,7 @@
 !/mcp_ping.py
 !/mcp_utils.py
 !/mcp_usage.py
+!/mcp_asgi.py
 !/tests/
 !/check_venv_invariants.sh
 tests/__pycache__/
