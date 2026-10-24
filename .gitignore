@@ -9,3 +9,4 @@
 !/mcp_ping.py
 !/tests/
 !/check_venv_invariants.sh
+tests/__pycache__/
