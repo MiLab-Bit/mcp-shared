@@ -433,3 +433,64 @@ def search_quotes(symbol: str = "", provider: str = "", limit: int = 20) -> list
     return sc.select(QUOTES_TABLE,
                      columns="id,provider,source,symbol,name,dtype,value,change_pct,as_of",
                      eq=eq or None, order="as_of.desc", limit=limit) or []
+
+
+def quote_health(sample=500):
+    """行情缓存新鲜度露出（B2）：按 provider 聚合条数/symbol 数/最近 as_of；
+    判定按 as_of 年龄（行情时效口径）：healthy(<36h)/stale(<96h)/failing/empty。"""
+    from datetime import datetime, timezone
+    try:
+        rows = sc.select(QUOTES_TABLE, columns="provider,symbol,dtype,as_of",
+                         order="as_of.desc", limit=sample) or []
+    except Exception:
+        rows = []
+    now = datetime.now(timezone.utc)
+
+    def _age_h(iso):
+        if not iso:
+            return None
+        try:
+            s = str(iso).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (now - dt).total_seconds() / 3600.0
+        except Exception:
+            return None
+
+    def _grade(age):
+        if age is None:
+            return "empty"
+        if age < 36:
+            return "healthy"
+        if age < 96:
+            return "stale"
+        return "failing"
+
+    by_prov = {}
+    for r in rows:
+        p = r.get("provider") or "unknown"
+        s = by_prov.setdefault(p, {"provider": p, "records": 0, "symbols": set(),
+                                   "last_as_of": None, "age_hours": None})
+        s["records"] += 1
+        if r.get("symbol"):
+            s["symbols"].add(r["symbol"])
+        ao = r.get("as_of") or ""
+        if ao and (s["last_as_of"] is None or ao > s["last_as_of"]):
+            s["last_as_of"] = ao
+        age = _age_h(ao)
+        if age is not None and (s["age_hours"] is None or age < s["age_hours"]):
+            s["age_hours"] = age
+    providers = sorted(by_prov.values(), key=lambda s: -s["records"])
+    for s in providers:
+        s["health"] = _grade(s["age_hours"])
+        s["symbol_count"] = len(s.pop("symbols"))
+        s["age_hours"] = round(s["age_hours"], 1) if s["age_hours"] is not None else None
+    newest_age = min((s["age_hours"] for s in providers if s["age_hours"] is not None), default=None)
+    return {
+        "health": _grade(newest_age),
+        "sample": sample,
+        "sampled_records": len(rows),
+        "providers": providers,
+        "newest_age_hours": newest_age,
+    }
