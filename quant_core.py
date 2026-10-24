@@ -192,70 +192,6 @@ def alltick(query: str = "1.600519", window: str = "day", limit: int = 5) -> dic
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-# ---------------- 东方财富 (免费HTTP, 无token, 主力A股/美股) ----------------
-def _emo_secid(symbol="600519"):
-    """把 symbol 解析为东财 secid。支持带前缀的完整形式或纯代码。"""
-    s = str(symbol).upper().strip()
-    if "." in s and s[0] in "0123456789":
-        return s  # 已是 secid 如 1.600519 / 105.AAPL
-    if s.isdigit():
-        if s.startswith(("6", "9", "5")):
-            return f"1.{s}"  # 沪/指数/ETF
-        if s.startswith(("4", "8")):
-            return f"0.{s}"  # 北交所/老三板 走深市通道
-        return f"0.{s}"      # 深市 000/001/002/300
-    # 字母开头：美股/港股/指数
-    return f"105.{s}"  # 美股默认 105（NASD/美交易）足够绝大多数
-
-
-def eastmoney_quote(symbol: str = "600519") -> dict:
-    """东方财富即时行情（免费）。symbol 支持 600519 / 1.600519 / AAPL / 105.AAPL。"""
-    secid = _emo_secid(symbol)
-    url = ("https://push2.eastmoney.com/api/qt/stock/get"
-           f"?secid={secid}&fields=f43,f57,f58,f60,f169,f170,f171,f86")
-    try:
-        st, b, ms = _http(url, headers=HERMES_UA)
-        d = json.loads(b)
-        data = d.get("data") or {}
-        if data.get("f57") is None:
-            return {"error": f"symbol not found: {symbol}", "http": st}
-        return {"provider": "eastmoney", "symbol": symbol, "secid": secid, "http": st,
-                "name": data.get("f58"), "code": data.get("f57"),
-                "price": data.get("f43"), "change_pct": data.get("f170"),
-                "high": data.get("f171"), "low": data.get("f169"),
-                "volume": data.get("f86"), "ms": ms}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
-
-
-def eastmoney_kline(symbol: str = "600519", period: str = "day", limit: int = 90) -> dict:
-    """东方财富K线。period: day(日)/week(周)/month(月)/60(60分)。"""
-    secid = _emo_secid(symbol)
-    klt = {"day": "101", "week": "102", "month": "103", "min1": "1",
-           "min5": "5", "min30": "30", "min60": "60"}.get(period, "101")
-    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
-           f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
-           f"&klt={klt}&lmt={limit}")
-    try:
-        st, b, ms = _http(url, headers=HERMES_UA)
-        d = json.loads(b)
-        k = d.get("data")
-        if not k:
-            return {"error": f"no kline data for {symbol}", "provider": "eastmoney", "http": st}
-        klines = k.get("klines") or []
-        out = []
-        for line in klines:
-            p = line.split(",")  # date,open,close,high,low,vol,amount,amplitude
-            if len(p) >= 6:
-                out.append({"date": p[0], "open": p[1], "close": p[2],
-                            "high": p[3], "low": p[4], "volume": p[5]})
-        name = k.get("name") or symbol
-        return {"provider": "eastmoney", "symbol": symbol, "secid": secid, "name": name,
-                "period": period, "http": st, "count": len(out), "klines": out}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
-
-
 # ---------------- 腾讯 gtimg (免费HTTP, 无token, 免费主力 A股/美股/港股/指数) ----------------
 # 格式: v_<code>="1~名称~代码~现价~昨收~今开~成交手~外盘~内盘~买一~卖一~...~最高~最低~...~涨跌~涨跌%~..."
 # 字段以 ~ 分隔（不同市场列位大体一致，解析时容错）。
@@ -351,6 +287,70 @@ def tencent_batch(symbols: str = "600519,000001") -> dict:
             return {"error": "no batch data", "raw": body[:200]}
         return {"provider": "tencent", "symbols": len(lst), "http": 200,
                 "quotes": out, "ms": _now()}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _tx_us_full(sym: str) -> str:
+    """us 裸代码 -> 带交易所后缀全码（如 AAPL.OQ / JPM.N）。
+
+    腾讯 K 线对裸 us 代码只返回首尾两行（上市日+最新日），必须带交易所后缀才返回
+    完整窗口。行情接口 qt.gtimg.cn 的 field[2] 即全码，一次轻量请求解析。
+    """
+    try:
+        req = ur.Request(f"https://qt.gtimg.cn/q={sym}", headers=HERMES_UA)
+        with ur.urlopen(req, timeout=10) as r:
+            raw = r.read().decode("gbk", "replace")
+        parts = raw.split("=", 1)[1].strip().strip(";").strip('"').split("~")
+        full = parts[2] if len(parts) > 2 else ""
+        if "." in full:
+            return "us" + full
+    except Exception:
+        pass
+    return sym
+
+
+def tencent_kline(symbol: str = "600519", period: str = "day", limit: int = 90) -> dict:
+    """腾讯K线（免费直连）。period: day/week/month/min1/min5/min30/min60；默认前复权。
+
+    日/周/月走 web.ifzq.gtimg.cn fqkline（qfq 前复权；指数/美股无复权概念，
+    腾讯恒返裸键 day/week/month）；分钟走 ifzq.gtimg.cn mkline。
+    2026-10-24 起替代 eastmoney push2his 源——东财 WAF 对阿里云出口 IP 的
+    /api/qt/ 行情路径实施断连封禁（详见批次报告）。
+    """
+    sym = _tx_symbol(symbol)
+    if sym.startswith("us") and "." not in sym:
+        sym = _tx_us_full(sym)
+    minute = period.startswith("min")
+    if minute:
+        url = (f"https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+               f"?param={sym},m{period[3:]},,{limit}")
+    else:
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               f"?param={sym},{period},,,{limit},qfq")
+    try:
+        st, b, ms = _http(url, headers=HERMES_UA)
+        d = json.loads(b)
+        node = (d.get("data") or {}).get(sym)
+        if not node:
+            return {"error": f"no kline data for {symbol}", "provider": "tencent", "http": st}
+        key = ("m" + period[3:]) if minute else (
+            "qfq" + period if ("qfq" + period) in node else period)
+        rows = node.get(key) or []
+        out = []
+        for r in rows:
+            if len(r) >= 6:
+                dt = r[0]
+                if minute and len(dt) == 12 and dt.isdigit():
+                    dt = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]} {dt[8:10]}:{dt[10:12]}"
+                out.append({"date": dt, "open": r[1], "close": r[2],
+                            "high": r[3], "low": r[4], "volume": r[5]})
+        name = symbol
+        qt = (node.get("qt") or {}).get(sym)
+        if qt and len(qt) > 1:
+            name = qt[1]
+        return {"provider": "tencent", "symbol": symbol, "tx_symbol": sym, "name": name,
+                "period": period, "http": st, "count": len(out), "klines": out}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
