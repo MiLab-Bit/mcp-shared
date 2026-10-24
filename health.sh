@@ -1,6 +1,6 @@
 #!/bin/bash
 # SY Realm 全栈健康检查
-# 被 OpenClaw Agent 调用，输出结构化状态
+# 被 Hermes Agent 调用，输出结构化状态
 
 echo "============================================"
 echo "  SY REALM HEALTH CHECK - $(date '+%Y-%m-%d %H:%M:%S')"
@@ -20,7 +20,7 @@ done
 
 echo ""
 echo "## Docker Containers"
-for c in temporal-temporal-1 temporal-temporal-ui-1 temporal-temporal-postgresql-1 openclaw; do
+for c in temporal-temporal-1 temporal-temporal-ui-1 temporal-temporal-postgresql-1; do
     status=$(docker inspect -f '{{.State.Status}}' $c 2>/dev/null)
     health=$(docker inspect -f '{{.State.Health.Status}}' $c 2>/dev/null)
     if [ "$status" = "running" ]; then

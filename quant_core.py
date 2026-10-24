@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-quant_core.py — 量化数据商领域逻辑（共享，供 mcp-quant / -macro / -alternative 复用）。
+quant_core.py — Hermes 量化数据商领域逻辑（共享，供 hermes-quant / -macro / -alt 复用）。
 能力：
   - 从 Supabase quant_providers 读凭证
   - 各 provider adapter：tushare/fred/alpha_vantage/akshare/coingecko/polymarket/alltick
@@ -27,10 +27,12 @@ def _now():
 
 
 def _as_iso(date_str):
-    """把 20260101 / 2026-01-01 / 2026-01-01 00:00:00 归一为 ISO。"""
+    """把 20260101 / 2026-01-01 / 2026-01-01 00:00:00 归一为 ISO 8601。"""
     if not date_str:
         return _now()
     s = str(date_str).strip()
+    if len(s) == 8 and s.isdigit():  # 20260101 → 2026-01-01T00:00:00
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}T00:00:00"
     s = s.replace(" ", "T")
     return s
 
@@ -98,6 +100,8 @@ def tushare(api_name: str, params: dict, fields: str = "") -> dict:
 def alpha_vantage(function: str = "GLOBAL_QUOTE", symbol: str = "IBM",
                   symbol2: str = "", interval: str = "") -> dict:
     token = _prov_fields("alpha_vantage").get("token")
+    if not token:
+        return {"error": "alpha_vantage token missing"}
     prm = {"function": function, "symbol": symbol, "apikey": token}
     if symbol2: prm["symbol"] = f"{symbol},{symbol2}"  # FX 2 symbol
     if interval: prm["interval"] = interval
@@ -114,8 +118,24 @@ def alpha_vantage(function: str = "GLOBAL_QUOTE", symbol: str = "IBM",
 
 
 # ---------------- FRED ---------------
+def fx_rate(from_c: str = "USD", to_c: str = "CNY") -> dict:
+    """外汇汇率（Alpha Vantage CURRENCY_EXCHANGE_RATE）。"""
+    token = _prov_fields("alpha_vantage").get("token")
+    if not token:
+        return {"error": "alpha_vantage token missing"}
+    q = up.urlencode({"function": "CURRENCY_EXCHANGE_RATE",
+                      "from_currency": from_c, "to_currency": to_c, "apikey": token})
+    try:
+        st, b, ms = _http("https://www.alphavantage.co/query?" + q)
+        return {"provider": "alpha_vantage", "http": st, "data": json.loads(b), "ms": ms}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def fred(series_id: str, limit: int = 10, sort: str = "desc") -> dict:
     tk = _prov_fields("fred").get("token")
+    if not tk:
+        return {"error": "fred token missing"}
     prm = {"series_id": series_id, "api_key": tk, "file_type": "json",
            "sort_order": sort, "limit": limit}
     url = "https://api.stlouisfed.org/fred/series/observations?" + up.urlencode(prm)
@@ -133,24 +153,26 @@ def fred(series_id: str, limit: int = 10, sort: str = "desc") -> dict:
 # ---------------- CoinGecko (走 mihomo 代理；宿主机 :7890) ---------------
 PROXY = os.environ.get("MCP_HTTP_PROXY", "http://127.0.0.1:7890")
 
+HERMES_UA = {"User-Agent": "Mozilla/5.0 (HermesAgent/1.0; +https://github.com/MiLab-Bit) respect robots",
+             "Accept": "application/json"}
+
 
 def coingecko(ids: str = "bitcoin", vs: str = "usd") -> dict:
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies={vs}"
     try:
-        st, b, ms = _http(url, proxy=PROXY, headers=COMMON_UA)
+        st, b, ms = _http(url, proxy=PROXY, headers=HERMES_UA)
         return {"provider": "coingecko", "http": st, "data": json.loads(b), "ms": ms}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}（经代理 {PROXY}）"}
 
 
 # ---------------- Polymarket (走 mihomo 代理) ---------------
-COMMON_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)", "Accept": "application/json"}
 
 
 def polymarket(limit: int = 5) -> dict:
     url = f"https://gamma-api.polymarket.com/events?limit={limit}"
     try:
-        st, b, ms = _http(url, proxy=PROXY, headers=COMMON_UA)
+        st, b, ms = _http(url, proxy=PROXY, headers=HERMES_UA)
         d = json.loads(b)
         return {"provider": "polymarket", "http": st, "events_count": len(d),
                 "events": d[:limit], "ms": ms}
@@ -192,7 +214,7 @@ def eastmoney_quote(symbol: str = "600519") -> dict:
     url = ("https://push2.eastmoney.com/api/qt/stock/get"
            f"?secid={secid}&fields=f43,f57,f58,f60,f169,f170,f171,f86")
     try:
-        st, b, ms = _http(url, headers={"User-Agent": "curl/8"})
+        st, b, ms = _http(url, headers=HERMES_UA)
         d = json.loads(b)
         data = d.get("data") or {}
         if data.get("f57") is None:
@@ -215,7 +237,7 @@ def eastmoney_kline(symbol: str = "600519", period: str = "day", limit: int = 90
            f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
            f"&klt={klt}&lmt={limit}")
     try:
-        st, b, ms = _http(url, headers={"User-Agent": "curl/8"})
+        st, b, ms = _http(url, headers=HERMES_UA)
         d = json.loads(b)
         k = d.get("data")
         if not k:
@@ -254,8 +276,8 @@ def _tx_symbol(symbol):
     return f"us{s.upper()}"
 
 
-def _tx_parse(name, body):
-    """解析单条腾讯 v_xxx 记录。"""
+def _tx_parse(body):
+    """解析单条腾讯 v_xxx 记录。字段不足 40 段返回 None。"""
     inner = body.split('="', 1)[-1].rsplit('"', 1)[0] if '"' in body else body
     parts = inner.split("~")
     if len(parts) < 40:
@@ -288,12 +310,12 @@ def tencent_quote(symbol: str = "600519") -> dict:
     url = f"https://qt.gtimg.cn/q={tq}"
     try:
         # 腾讯返回为 GBK（含中文名），需 GBK 解码
-        pl = {"User-Agent": "Mozilla/5.0"}
+        pl = HERMES_UA
         req = ur.Request(url, headers=pl)
         with ur.urlopen(req, timeout=15) as r:
             raw = r.read().decode("gbk", "replace")
         st = 200
-        parsed = _tx_parse(raw, raw)
+        parsed = _tx_parse(raw)
         if not parsed:
             return {"error": f"no data for {symbol} (code:{tq})", "http": st}
         return {"provider": "tencent", "symbol": symbol, "code": tq, "http": st,
@@ -312,7 +334,7 @@ def tencent_batch(symbols: str = "600519,000001") -> dict:
     tqs = ",".join(_tx_symbol(s) for s in lst)
     url = f"https://qt.gtimg.cn/q={tqs}"
     try:
-        req = ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = ur.Request(url, headers=HERMES_UA)
         with ur.urlopen(req, timeout=15) as r:
             body = r.read().decode("gbk", "replace")
         # 每行 v_xxx="..."
@@ -322,7 +344,7 @@ def tencent_batch(symbols: str = "600519,000001") -> dict:
             if not line.startswith("v_"):
                 continue
             code = line.split("=", 1)[0][2:]
-            dd = _tx_parse(name=code, body=line)
+            dd = _tx_parse(line)
             if dd:
                 out[code] = dd
         if not out:
@@ -339,10 +361,8 @@ def sina_quote(symbol: str = "sh600519") -> dict:
     s = str(symbol).strip().lower()
     url = f"https://hq.sinajs.cn/list={s}"
     try:
-        req = ur.Request(url, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://finance.sina.com.cn/",
-        })
+        req = ur.Request(url, headers={**HERMES_UA,
+                                       "Referer": "https://finance.sina.com.cn/"})
         with ur.urlopen(req, timeout=15) as r:
             body = r.read().decode("gbk", "replace")
         # var hq_str_sh600519="名称,今开,昨收,现价,最高,最低,买一,卖一,成交量,成交额,日期,时间,...";
@@ -350,11 +370,13 @@ def sina_quote(symbol: str = "sh600519") -> dict:
         p = inner.split(",")
         if len(p) < 6:
             return {"error": f"no sina data for {s}: {body[:120]}"}
+        price, prev = _to_num(p[3]), _to_num(p[2])
+        chg_pct = round((price - prev) / prev * 100, 2) if price and prev else None
         return {"provider": "sina", "symbol": s,
-                "name": p[0], "open": _to_num(p[1]), "prev_close": _to_num(p[2]),
-                "price": _to_num(p[3]), "high": _to_num(p[4]), "low": _to_num(p[5]),
+                "name": p[0], "open": _to_num(p[1]), "prev_close": prev,
+                "price": price, "high": _to_num(p[4]), "low": _to_num(p[5]),
                 "volume": _to_num(p[8]), "amount": _to_num(p[9]),
-                "date": p[30] if len(p) > 30 else "", "change_pct": None, "ms": _now()}
+                "date": p[30] if len(p) > 30 else "", "change_pct": chg_pct, "ms": _now()}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -375,6 +397,15 @@ def _to_num(v):
         return None
 
 
+def _norm_payload(p):
+    """payload 归一：dict/list → JSON 字符串；已是字符串 → 原样（避免二次转义）。"""
+    if p is None or p == "":
+        p = {}
+    if isinstance(p, (dict, list)):
+        return json.dumps(p, ensure_ascii=False)
+    return str(p)
+
+
 def save_quotes(rows):
     """rows: list of dict（含 provider/source/symbol/name/dtype/value/...）。"""
     if not rows:
@@ -389,7 +420,7 @@ def save_quotes(rows):
         "value": _to_num(r.get("value")),
         "change_pct": _to_num(r.get("change_pct")),
         "as_of": r.get("as_of") or _now(),
-        "payload": json.dumps(r.get("payload") or {}, ensure_ascii=False),
+        "payload": _norm_payload(r.get("payload")),
     } for r in rows]
     sc.insert(QUOTES_TABLE, payloads)
     return {"inserted": len(payloads)}

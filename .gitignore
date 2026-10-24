@@ -7,3 +7,5 @@
 !/quant_core.py
 !/health.sh
 !/mcp_ping.py
+!/tests/
+!/check_venv_invariants.sh
