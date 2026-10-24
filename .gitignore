@@ -7,6 +7,7 @@
 !/quant_core.py
 !/health.sh
 !/mcp_ping.py
+!/mcp_utils.py
 !/tests/
 !/check_venv_invariants.sh
 tests/__pycache__/
