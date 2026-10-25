@@ -31,7 +31,7 @@ alter table quant_token_pool enable row level security;
 
 drop policy if exists "service_role all" on quant_token_pool;
 create policy "service_role all" on quant_token_pool
-    for all to service_role using (true) with (true);
+    for all to service_role using (true) with check (true);
 
 -- 入池示例（按需替换 token 值；执行后 30s 内代码侧自动生效）：
 -- insert into quant_token_pool (provider, token, status, weight, note)
