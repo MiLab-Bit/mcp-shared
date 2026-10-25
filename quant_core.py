@@ -494,3 +494,86 @@ def quote_health(sample=500):
         "providers": providers,
         "newest_age_hours": newest_age,
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# akshare adapter（P1：免费、无 token；国内源如新浪直连，东方财富等经网络可达性优雅降级）
+# 懒加载：不在模块顶层 import akshare，避免无该包的环境（如 CI runner）import 失败。
+# ──────────────────────────────────────────────────────────────
+def _clamp_limit(n, default):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, default))
+
+
+def akshare_call(func: str, params=None) -> dict:
+    """通用 akshare 调用分发器（meta-tool 雏形）。
+    func: akshare 函数名（如 stock_zh_a_daily / stock_hk_hist / fund_etf_hist_em）；
+    params: 关键字参数字典或 JSON 字符串。
+    失败（未安装 / 无此函数 / 上游改版 / 网络不可达）一律返回 {"error":...} 而非抛异常。
+    成功返回 {"provider":"akshare","func":...,"columns":...,"count":...,"rows":[...]}。"""
+    try:
+        import akshare as ak
+    except ImportError:
+        return {"error": "akshare 未安装（pip install akshare）"}
+    try:
+        fn = getattr(ak, func, None)
+        if fn is None:
+            return {"error": f"akshare 无函数 {func}"}
+        p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+        df = fn(**p)
+        if hasattr(df, "to_dict") and hasattr(df, "columns"):
+            recs = df.head(200).to_dict(orient="records")
+            return {"provider": "akshare", "func": func,
+                    "columns": list(df.columns), "count": len(recs), "rows": recs}
+        return {"provider": "akshare", "func": func, "data": df}
+    except Exception as e:  # akshare 接口易因上游改版 / 网络失效
+        return {"error": f"akshare.{func}: {type(e).__name__}: {e}"}
+
+
+def akshare_stock_hist(symbol: str = "600519", market: str = "sh",
+                       start: str = "20260101", end: str = "20261231",
+                       adjust: str = "qfq", limit: int = 200) -> dict:
+    """A股日线（新浪源 stock_zh_a_daily，免 token、国内直连稳定）。
+    symbol: 数字代码如 600519；market: sh/sz。返回最近 limit 条。"""
+    lim = _clamp_limit(limit, 200)
+    res = akshare_call("stock_zh_a_daily",
+                       {"symbol": f"{market}{symbol}", "start_date": start,
+                        "end_date": end, "adjust": adjust})
+    if "error" in res:
+        return res
+    rows = (res.get("rows") or [])[-lim:]
+    return {**res, "rows": rows, "count": len(rows)}
+
+
+def akshare_hk_hist(symbol: str = "00700", adjust: str = "qfq", limit: int = 200) -> dict:
+    """港股历史（东方财富源 stock_hk_hist；网络不可达时优雅降级）。symbol: 5位代码如 00700。"""
+    lim = _clamp_limit(limit, 200)
+    res = akshare_call("stock_hk_hist", {"symbol": symbol, "adjust": adjust})
+    if "error" in res:
+        return res
+    rows = (res.get("rows") or [])[-lim:]
+    return {**res, "rows": rows, "count": len(rows)}
+
+
+def akshare_etf_hist(symbol: str = "512660", adjust: str = "qfq", limit: int = 200) -> dict:
+    """ETF/基金历史（东方财富源 fund_etf_hist_em；网络不可达时优雅降级）。symbol: 6位代码如 512660。"""
+    lim = _clamp_limit(limit, 200)
+    res = akshare_call("fund_etf_hist_em", {"symbol": symbol, "adjust": adjust})
+    if "error" in res:
+        return res
+    rows = (res.get("rows") or [])[-lim:]
+    return {**res, "rows": rows, "count": len(rows)}
+
+
+def akshare_fund_flow(symbol: str = "600519", market: str = "sh") -> dict:
+    """A股个股资金流向（东方财富源 stock_individual_fund_flow：主力/超大单/大单/中单/小单）。"""
+    return akshare_call("stock_individual_fund_flow", {"stock": symbol, "market": market})
+
+
+def akshare_macro(indicator: str = "macro_china_cpi_yearly") -> dict:
+    """中国宏观经济指标（东方财富源，如 CPI/PMI 同比）。indicator: akshare 宏函数名。"""
+    return akshare_call(indicator, {})
+
