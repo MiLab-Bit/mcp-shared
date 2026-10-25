@@ -10,7 +10,7 @@ quant_core.py — Hermes 量化数据商领域逻辑（共享，供 hermes-quant
   ❌ coingecko / polymarket  Err 101 不可达（需代理）
   ❌ alltick 401 token 无效
 """
-import json, os, sys, time
+import json, os, sys, threading, time
 from datetime import datetime, timezone
 
 import supabase_client as sc
@@ -70,7 +70,13 @@ def _http(url, timeout=15, method=None, data=None, headers=None, proxy=None):
             body = r.read().decode("utf-8", "replace")
             return r.status, body, round((time.time() - t0) * 1000)
     except ur.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace"), round((time.time() - t0) * 1000)
+        # 容错：部分环境/构造下 e.read() 可能抛异常（如 fp 为 None），
+        # 此时仅返回状态码 + 空 body，避免把受限源的 4xx/5xx 拖垮整个 adapter（P6 健壮性）。
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return e.code, body, round((time.time() - t0) * 1000)
 
 
 # ---------------- TuShare ---------------
@@ -182,14 +188,26 @@ def polymarket(limit: int = 5) -> dict:
 
 # ---------------- Alltick ---------------
 def alltick(query: str = "1.600519", window: str = "day", limit: int = 5) -> dict:
+    """Alltick 实时K线。token 缺失 / 401 / 非 200 / 业务错误 均返回结构化 error（P5/P6 健壮化）；
+    不再把 401 响应体当成功数据返回。"""
     tk = _prov_fields("alltick").get("token")
+    if not tk:
+        return {"error": "alltick token 缺失（请在 Supabase quant_providers 配置）"}
     url = (f"https://quote.alltick.io/quote-stock-b-api/kline?token={tk}"
            f"&query={up.quote(query)}&window={window}&limit={limit}")
     try:
         st, b, ms = _http(url)
-        return {"provider": "alltick", "http": st, "data": json.loads(b), "ms": ms}
+        if st != 200:
+            return {"error": f"alltick HTTP {st}", "http": st, "body": b[:200], "ms": ms}
+        d = json.loads(b)
+        if isinstance(d, dict):
+            code = d.get("code")
+            if code not in (None, 0, "0"):
+                return {"error": f"alltick 业务错误 code={code}: {d.get('msg')}",
+                        "http": st, "ms": ms}
+        return {"provider": "alltick", "http": st, "data": d, "ms": ms}
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": f"alltick: {type(e).__name__}: {e}"}
 
 
 # ---------------- 腾讯 gtimg (免费HTTP, 无token, 免费主力 A股/美股/港股/指数) ----------------
@@ -508,72 +526,264 @@ def _clamp_limit(n, default):
     return max(1, min(n, default))
 
 
-def akshare_call(func: str, params=None) -> dict:
+# ═══════════════════════════════════════════════════════════════════════
+# TTL 缓存层（P2）
+# 目的：扛 tushare/alpha_vantage/fred 限频、降低重复 API 调用。
+# 实现：进程内 dict + 时间戳（stateless HTTP 单实例即可；多 worker 各自独立，可接受）。
+# 约定：① 不缓存 error 结果（避免把瞬时失败钉死）；② ttl<=0 关闭缓存直连；
+#       ③ 返回值统一追加 cache 字段（hit / miss）便于观测与测试。
+# ═══════════════════════════════════════════════════════════════════════
+
+_CACHE: dict = {}
+_CACHE_LOCK = threading.Lock()
+
+# 各受限 provider 默认 TTL（秒）
+_TTL_DEFAULTS = {
+    "tushare": 300,        # 积分制限频 → 5min
+    "alpha_vantage": 600,  # 每日 25 次免费 → 10min
+    "fred": 1800,          # 宏观序列 → 30min
+    "akshare": 3600,       # 日频数据 → 1h
+}
+
+
+def cache_get(key, ttl, fetcher, *args, **kwargs):
+    """TTL 缓存分发器。
+    key: 缓存键；ttl: 秒（<=0 关闭缓存，直连 fetcher）；
+    fetcher: 可调用（通常是某 adapter），异常原样抛出、不缓存。
+    命中且未过期 → 返回副本并标记 cache='hit'，不调用 fetcher；
+    未命中/过期 → 调用 fetcher，结果非 error 则缓存并标记 cache='miss'。"""
+    if not ttl or ttl <= 0:
+        return fetcher(*args, **kwargs)
+    now = time.time()
+    with _CACHE_LOCK:
+        e = _CACHE.get(key)
+        if e is not None and (now - e[0]) < ttl:
+            out = dict(e[1])
+            out["cache"] = "hit"
+            return out
+    res = fetcher(*args, **kwargs)
+    if isinstance(res, dict) and "error" not in res:
+        with _CACHE_LOCK:
+            _CACHE[key] = (time.time(), res)
+        res = dict(res)
+        res["cache"] = "miss"
+    return res
+
+
+def cache_clear():
+    """清空缓存（测试/运维用）。"""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _ttl(ttl, provider):
+    return _TTL_DEFAULTS[provider] if ttl is None else ttl
+
+
+def tushare_cached(api_name, params, fields="", ttl=None) -> dict:
+    """TuShare 限频保护：缓存 5min。key 含 api_name+params+fields。"""
+    ttl = _ttl(ttl, "tushare")
+    key = f"tushare:{api_name}:{json.dumps(params or {}, sort_keys=True, default=str)}:{fields}"
+    return cache_get(key, ttl, tushare, api_name, params, fields)
+
+
+def alpha_vantage_cached(function="GLOBAL_QUOTE", symbol="IBM", symbol2="",
+                         interval="", ttl=None) -> dict:
+    """Alpha Vantage 限频保护：缓存 10min。"""
+    ttl = _ttl(ttl, "alpha_vantage")
+    key = f"av:{function}:{symbol}:{symbol2}:{interval}"
+    return cache_get(key, ttl, alpha_vantage, function, symbol, symbol2, interval)
+
+
+def fx_rate_cached(from_c="USD", to_c="CNY", ttl=None) -> dict:
+    """外汇汇率缓存（同 alpha_vantage 限频口径）。"""
+    ttl = _ttl(ttl, "alpha_vantage")
+    key = f"fx:{from_c}:{to_c}"
+    return cache_get(key, ttl, fx_rate, from_c, to_c)
+
+
+def fred_cached(series_id="GDP", limit=10, sort="desc", ttl=None) -> dict:
+    """FRED 宏观序列缓存 30min。"""
+    ttl = _ttl(ttl, "fred")
+    key = f"fred:{series_id}:{limit}:{sort}"
+    return cache_get(key, ttl, fred, series_id, limit, sort)
+
+
+# ─────────── akshare 缓存（P2）：给具名封装默认开启 1h 缓存 ───────────
+def akshare_call(func: str, params=None, ttl=None) -> dict:
     """通用 akshare 调用分发器（meta-tool 雏形）。
-    func: akshare 函数名（如 stock_zh_a_daily / stock_hk_hist / fund_etf_hist_em）；
-    params: 关键字参数字典或 JSON 字符串。
-    失败（未安装 / 无此函数 / 上游改版 / 网络不可达）一律返回 {"error":...} 而非抛异常。
-    成功返回 {"provider":"akshare","func":...,"columns":...,"count":...,"rows":[...]}。"""
-    try:
-        import akshare as ak
-    except ImportError:
-        return {"error": "akshare 未安装（pip install akshare）"}
-    try:
-        fn = getattr(ak, func, None)
-        if fn is None:
-            return {"error": f"akshare 无函数 {func}"}
-        p = params if isinstance(params, dict) else (json.loads(params) if params else {})
-        df = fn(**p)
-        if hasattr(df, "to_dict") and hasattr(df, "columns"):
-            recs = df.head(200).to_dict(orient="records")
-            return {"provider": "akshare", "func": func,
-                    "columns": list(df.columns), "count": len(recs), "rows": recs}
-        return {"provider": "akshare", "func": func, "data": df}
-    except Exception as e:  # akshare 接口易因上游改版 / 网络失效
-        return {"error": f"akshare.{func}: {type(e).__name__}: {e}"}
+    func: akshare 函数名；params: 关键字参数字典或 JSON 字符串；ttl: 可选缓存秒数。
+    失败（未安装/无此函数/上游改版/网络不可达）一律返回 {"error":...} 而非抛异常；
+    ttl>0 时按 func+params 缓存成功结果（不缓存 error）。"""
+    def _fetch():
+        try:
+            import akshare as ak
+        except ImportError:
+            return {"error": "akshare 未安装（pip install akshare）"}
+        try:
+            fn = getattr(ak, func, None)
+            if fn is None:
+                return {"error": f"akshare 无函数 {func}"}
+            p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+            df = fn(**p)
+            if hasattr(df, "to_dict") and hasattr(df, "columns"):
+                recs = df.head(200).to_dict(orient="records")
+                return {"provider": "akshare", "func": func,
+                        "columns": list(df.columns), "count": len(recs), "rows": recs}
+            return {"provider": "akshare", "func": func, "data": df}
+        except Exception as e:  # akshare 接口易因上游改版 / 网络失效
+            return {"error": f"akshare.{func}: {type(e).__name__}: {e}"}
+    if ttl and ttl > 0:
+        key = f"akshare:{func}:{json.dumps(params or {}, sort_keys=True, default=str)}"
+        return cache_get(key, ttl, _fetch)
+    return _fetch()
 
 
 def akshare_stock_hist(symbol: str = "600519", market: str = "sh",
                        start: str = "20260101", end: str = "20261231",
-                       adjust: str = "qfq", limit: int = 200) -> dict:
-    """A股日线（新浪源 stock_zh_a_daily，免 token、国内直连稳定）。
-    symbol: 数字代码如 600519；market: sh/sz。返回最近 limit 条。"""
+                       adjust: str = "qfq", limit: int = 200, ttl=None) -> dict:
+    """A股日线（新浪源 stock_zh_a_daily，免 token、国内直连稳定）。默认缓存 1h。"""
     lim = _clamp_limit(limit, 200)
+    ttl = _ttl(ttl, "akshare")
     res = akshare_call("stock_zh_a_daily",
                        {"symbol": f"{market}{symbol}", "start_date": start,
-                        "end_date": end, "adjust": adjust})
+                        "end_date": end, "adjust": adjust}, ttl=ttl)
     if "error" in res:
         return res
     rows = (res.get("rows") or [])[-lim:]
     return {**res, "rows": rows, "count": len(rows)}
 
 
-def akshare_hk_hist(symbol: str = "00700", adjust: str = "qfq", limit: int = 200) -> dict:
-    """港股历史（东方财富源 stock_hk_hist；网络不可达时优雅降级）。symbol: 5位代码如 00700。"""
+def akshare_hk_hist(symbol: str = "00700", adjust: str = "qfq", limit: int = 200, ttl=None) -> dict:
+    """港股历史（东方财富源 stock_hk_hist）。默认缓存 1h。网络不可达时优雅降级。"""
     lim = _clamp_limit(limit, 200)
-    res = akshare_call("stock_hk_hist", {"symbol": symbol, "adjust": adjust})
+    ttl = _ttl(ttl, "akshare")
+    res = akshare_call("stock_hk_hist", {"symbol": symbol, "adjust": adjust}, ttl=ttl)
     if "error" in res:
         return res
     rows = (res.get("rows") or [])[-lim:]
     return {**res, "rows": rows, "count": len(rows)}
 
 
-def akshare_etf_hist(symbol: str = "512660", adjust: str = "qfq", limit: int = 200) -> dict:
-    """ETF/基金历史（东方财富源 fund_etf_hist_em；网络不可达时优雅降级）。symbol: 6位代码如 512660。"""
+def akshare_etf_hist(symbol: str = "512660", adjust: str = "qfq", limit: int = 200, ttl=None) -> dict:
+    """ETF/基金历史（东方财富源 fund_etf_hist_em）。默认缓存 1h。网络不可达时优雅降级。"""
     lim = _clamp_limit(limit, 200)
-    res = akshare_call("fund_etf_hist_em", {"symbol": symbol, "adjust": adjust})
+    ttl = _ttl(ttl, "akshare")
+    res = akshare_call("fund_etf_hist_em", {"symbol": symbol, "adjust": adjust}, ttl=ttl)
     if "error" in res:
         return res
     rows = (res.get("rows") or [])[-lim:]
     return {**res, "rows": rows, "count": len(rows)}
 
 
-def akshare_fund_flow(symbol: str = "600519", market: str = "sh") -> dict:
-    """A股个股资金流向（东方财富源 stock_individual_fund_flow：主力/超大单/大单/中单/小单）。"""
-    return akshare_call("stock_individual_fund_flow", {"stock": symbol, "market": market})
+def akshare_fund_flow(symbol: str = "600519", market: str = "sh", ttl=None) -> dict:
+    """A股个股资金流向（东方财富源 stock_individual_fund_flow）。默认缓存 1h。"""
+    ttl = _ttl(ttl, "akshare")
+    return akshare_call("stock_individual_fund_flow",
+                        {"stock": symbol, "market": market}, ttl=ttl)
 
 
-def akshare_macro(indicator: str = "macro_china_cpi_yearly") -> dict:
-    """中国宏观经济指标（东方财富源，如 CPI/PMI 同比）。indicator: akshare 宏函数名。"""
-    return akshare_call(indicator, {})
+def akshare_macro(indicator: str = "macro_china_cpi_yearly", ttl=None) -> dict:
+    """中国宏观经济指标（东方财富源，如 CPI/PMI 同比）。默认缓存 1h。"""
+    ttl = _ttl(ttl, "akshare")
+    return akshare_call(indicator, {}, ttl=ttl)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 基本面（P3）：Alpha Vantage OVERVIEW / 财报三表
+# 复用已有 alpha_vantage token；限频（每日 25 次）→ 默认缓存 1h。
+# ═══════════════════════════════════════════════════════════════════════
+_VALID_FUND_KINDS = ("OVERVIEW", "INCOME_STATEMENT", "BALANCE_SHEET", "CASH_FLOW")
+
+
+def fundamentals(symbol: str = "IBM", kind: str = "OVERVIEW", ttl=None) -> dict:
+    """Alpha Vantage 基本面。
+    kind: OVERVIEW（公司概览/PE等） / INCOME_STATEMENT / BALANCE_SHEET / CASH_FLOW。
+    复用 alpha_vantage token；缺失时返回明确 error；限频时识别 'Note' 提示。"""
+    kind = (kind or "OVERVIEW").upper()
+    if kind not in _VALID_FUND_KINDS:
+        return {"error": f"fundamentals kind 无效（支持：{_VALID_FUND_KINDS}）"}
+    token = _prov_fields("alpha_vantage").get("token")
+    if not token:
+        return {"error": "alpha_vantage token missing"}
+    prm = {"function": kind, "symbol": symbol, "apikey": token}
+    url = "https://www.alphavantage.co/query?" + up.urlencode(prm)
+    ttl = _ttl(ttl, "alpha_vantage")
+
+    def _fetch():
+        try:
+            st, b, ms = _http(url)
+            d = json.loads(b)
+            if "Error Message" in d:
+                return {"error": d["Error Message"], "http": st}
+            if "Note" in d:  # 限频提示
+                return {"error": f"alpha_vantage 限频: {d['Note']}", "http": st}
+            return {"provider": "alpha_vantage", "kind": kind, "symbol": symbol,
+                    "http": st, "data": d, "ms": ms}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    if ttl and ttl > 0:
+        key = f"av_fund:{kind}:{symbol}"
+        return cache_get(key, ttl, _fetch)
+    return _fetch()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 元工具（P4）：通用调度，收敛工具面、便于后续扩源
+# ═══════════════════════════════════════════════════════════════════════
+def alpha_vantage_call(function: str = "GLOBAL_QUOTE", params=None, ttl=None) -> dict:
+    """通用 Alpha Vantage 调用（meta-tool）：function 为 AV 函数名，params 为参数字典
+    （可含 symbol/interval 等，token 自动注入）。返回原始 data；失败返回 {"error":...}。"""
+    token = _prov_fields("alpha_vantage").get("token")
+    if not token:
+        return {"error": "alpha_vantage token missing"}
+    p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+    prm = dict(p)
+    prm["function"] = function
+    prm["apikey"] = token
+    url = "https://www.alphavantage.co/query?" + up.urlencode(prm)
+    ttl = _ttl(ttl, "alpha_vantage")
+
+    def _fetch():
+        try:
+            st, b, ms = _http(url)
+            d = json.loads(b)
+            if "Error Message" in d:
+                return {"error": d["Error Message"], "http": st}
+            if "Note" in d:
+                return {"error": f"alpha_vantage 限频: {d['Note']}", "http": st}
+            return {"provider": "alpha_vantage", "function": function,
+                    "http": st, "data": d, "ms": ms}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    if ttl and ttl > 0:
+        key = f"av_call:{function}:{json.dumps(prm, sort_keys=True, default=str)}"
+        return cache_get(key, ttl, _fetch)
+    return _fetch()
+
+
+# 元工具路由表：provider -> dispatch(endpoint, params)
+_QUANT_CALL_ROUTES = {
+    "akshare": lambda ep, p: akshare_call(ep, p),
+    "alpha_vantage": lambda ep, p: alpha_vantage_call(ep, p),
+    "fred": lambda ep, p: fred_cached(ep, limit=(p or {}).get("limit", 10)
+                                      if isinstance(p, dict) else 10),
+}
+
+
+def quant_call(provider: str = "akshare", endpoint: str = "stock_zh_a_daily",
+               params=None) -> dict:
+    """元工具：统一入口调度各 provider 的通用 endpoint，收敛工具面、便于扩源。
+    provider: akshare / alpha_vantage / fred；endpoint: 该 provider 的接口名/函数名；
+    params: 参数字典或 JSON 字符串。
+    例：quant_call("alpha_vantage","TIME_SERIES_DAILY",{"symbol":"IBM"})。
+    未知 provider 返回 {"error":...} 而非抛异常。"""
+    if provider not in _QUANT_CALL_ROUTES:
+        return {"error": f"quant_call 不支持 provider={provider}"
+                        f"（支持：{list(_QUANT_CALL_ROUTES)}）"}
+    p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+    try:
+        return _QUANT_CALL_ROUTES[provider](endpoint, p)
+    except Exception as e:
+        return {"error": f"quant_call.{provider}.{endpoint}: {type(e).__name__}: {e}"}
 
