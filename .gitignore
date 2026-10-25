@@ -15,6 +15,7 @@
 !/mcp_auth.py
 !/metrics.py
 !/logging_utils.py
+!/ta.py
 !/tests/
 !/check_venv_invariants.sh
 !/.github/
