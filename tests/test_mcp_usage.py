@@ -1,7 +1,6 @@
 """mcp_usage 单测：JSON-RPC body 解析 + api_usage 记录（写入 mock，不触云端）。"""
 import json
 
-import mcp_usage
 from mcp_usage import record_usage, tool_from_body
 
 
@@ -85,6 +84,7 @@ def test_record_usage_silent_on_import_failure(monkeypatch):
 
 def test_body_replayer_replays_buffered_then_delegates():
     import asyncio
+
     from mcp_usage import BodyReplayer
 
     async def scenario():

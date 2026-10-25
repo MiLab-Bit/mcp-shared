@@ -11,7 +11,6 @@ import pytest
 
 import db
 
-
 # ---------- load_startup_data ----------
 
 def test_load_startup_data_cloud(monkeypatch):

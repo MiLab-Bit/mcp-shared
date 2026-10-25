@@ -3,8 +3,6 @@
 import asyncio
 import json
 
-import pytest
-
 import mcp_auth
 
 TOKENS = {"tok_abc123": {"name": "platform", "note": "测试 key"}}

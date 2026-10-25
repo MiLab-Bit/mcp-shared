@@ -6,9 +6,19 @@ MiLab 业务数据适配层
 - 云端不可用时自动回退本地 JSON，保证 CLI 离线可用
 提供给三个系统的领域函数：创业情报 / UTM / 爬虫
 """
-import os, sys, json
+import json
+import os
+import sys
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+
+def _data_path(subdir, fname):
+    """优先 <HERE>/<subdir>/<fname>；子目录不存在则回退 <HERE>/<fname>。
+    兼容两种部署布局（共享层内嵌子目录 vs 平铺），收敛重复的长路径表达式。"""
+    sub = os.path.join(HERE, subdir, fname)
+    return sub if os.path.isdir(os.path.join(HERE, subdir)) else os.path.join(HERE, fname)
 try:
     import supabase_client as sc
     _SB = sc.is_available()
@@ -30,9 +40,9 @@ def load_startup_data():
             return acts, user_projects, hosts
         except Exception as e:
             sys.stderr.write(f"[db] Supabase 读取失败，回退本地: {e}\n")
-    activity_lib = json.load(open(os.path.join(HERE, "startup-intel", "activity_library.json") if os.path.isdir(os.path.join(HERE,"startup-intel")) else os.path.join(HERE, "activity_library.json")))
-    user_projects = json.load(open(os.path.join(HERE, "startup-intel", "user_projects.json") if os.path.isdir(os.path.join(HERE,"startup-intel")) else os.path.join(HERE, "user_projects.json")))
-    hosts = json.load(open(os.path.join(HERE, "startup-intel", "hosts_registry.json") if os.path.isdir(os.path.join(HERE,"startup-intel")) else os.path.join(HERE, "hosts_registry.json")))
+    activity_lib = json.load(open(_data_path("startup-intel", "activity_library.json")))
+    user_projects = json.load(open(_data_path("startup-intel", "user_projects.json")))
+    hosts = json.load(open(_data_path("startup-intel", "hosts_registry.json")))
     acts = activity_lib.get("activities", activity_lib)
     hosts_data = hosts.get("hosts", hosts)
     return acts, user_projects, hosts_data
@@ -90,7 +100,7 @@ def load_utm_links(project_id=None):
         except Exception as e:
             sys.stderr.write(f"[db] Supabase UTM 读取失败，回退本地: {e}\n")
     db = _load_utm_local()
-    return [l for l in db["utm_links"] if project_id is None or l["project_id"] == project_id]
+    return [lnk for lnk in db["utm_links"] if project_id is None or lnk["project_id"] == project_id]
 
 def save_utm_link(entry):
     """写入一条 UTM 链接；云端按 full_url 去重，本地回退也按 url 去重"""
@@ -113,19 +123,19 @@ def save_utm_link(entry):
         except Exception as e:
             sys.stderr.write(f"[db] Supabase UTM 写入失败，回退本地: {e}\n")
     db = _load_utm_local()
-    if not any(l["utm_url"] == entry["utm_url"] for l in db["utm_links"]):
+    if not any(lnk["utm_url"] == entry["utm_url"] for lnk in db["utm_links"]):
         db["utm_links"].append(entry)
         _save_utm_local(db)
     return True
 
 def _load_utm_local():
-    p = os.path.join(HERE, "utm-tracker", "utm_database.json") if os.path.isdir(os.path.join(HERE, "utm-tracker")) else os.path.join(HERE, "utm_database.json")
+    p = _data_path("utm-tracker", "utm_database.json")
     if not os.path.exists(p):
         return {"version": "1.0", "utm_links": []}
     return json.load(open(p))
 
 def _save_utm_local(db):
-    p = os.path.join(HERE, "utm-tracker", "utm_database.json") if os.path.isdir(os.path.join(HERE, "utm-tracker")) else os.path.join(HERE, "utm_database.json")
+    p = _data_path("utm-tracker", "utm_database.json")
     json.dump(db, open(p, "w"), indent=2, ensure_ascii=False)
 
 

@@ -10,13 +10,15 @@ quant_core.py — Hermes 量化数据商领域逻辑（共享，供 hermes-quant
   ❌ coingecko / polymarket  Err 101 不可达（需代理）
   ❌ alltick 401 token 无效
 """
-import json, os, sys, threading, time
+import json
+import os
+import threading
+import time
+import urllib.parse as up
+import urllib.request as ur
 from datetime import datetime, timezone
 
 import supabase_client as sc
-
-import urllib.request as ur
-import urllib.parse as up
 
 QUOTES_TABLE = "quotes"
 PROV_TABLE = "quant_providers"
@@ -109,8 +111,10 @@ def alpha_vantage(function: str = "GLOBAL_QUOTE", symbol: str = "IBM",
     if not token:
         return {"error": "alpha_vantage token missing"}
     prm = {"function": function, "symbol": symbol, "apikey": token}
-    if symbol2: prm["symbol"] = f"{symbol},{symbol2}"  # FX 2 symbol
-    if interval: prm["interval"] = interval
+    if symbol2:
+        prm["symbol"] = f"{symbol},{symbol2}"  # FX 2 symbol
+    if interval:
+        prm["interval"] = interval
     url = "https://www.alphavantage.co/query?" + up.urlencode(prm)
     try:
         st, b, ms = _http(url)
@@ -260,7 +264,6 @@ def _tx_parse(body):
 def tencent_quote(symbol: str = "600519") -> dict:
     """腾讯即时行情（免费主力）。覆盖 sh/sz 中国股、us 美股、hk 港股、指数。"""
     tq = _tx_symbol(symbol)
-    q = tq[:2]
     url = f"https://qt.gtimg.cn/q={tq}"
     try:
         # 腾讯返回为 GBK（含中文名），需 GBK 解码
@@ -446,8 +449,10 @@ def save_quotes(rows):
 
 def search_quotes(symbol: str = "", provider: str = "", limit: int = 20) -> list:
     eq = {}
-    if symbol: eq["symbol"] = symbol
-    if provider: eq["provider"] = provider
+    if symbol:
+        eq["symbol"] = symbol
+    if provider:
+        eq["provider"] = provider
     return sc.select(QUOTES_TABLE,
                      columns="id,provider,source,symbol,name,dtype,value,change_pct,as_of",
                      eq=eq or None, order="as_of.desc", limit=limit) or []

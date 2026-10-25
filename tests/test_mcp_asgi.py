@@ -1,9 +1,8 @@
 """mcp_asgi 单测：/health 组装（路由插入、payload、extra 合并、extra 异常吞掉）。"""
-import json
 
-import pytest
-from mcp_asgi import build_health_app
 from starlette.testclient import TestClient
+
+from mcp_asgi import build_health_app
 
 
 class _FakeMCP:

@@ -5,7 +5,12 @@ MiLab 云端数据层 —— 标准库实现的 Supabase REST 客户端（零第
 凭证来源（按优先级）：环境变量 > 本目录 .supabase.env > /opt/shared/supabase.env
 仅使用 service_role 密钥（服务端写，绕过 RLS）；anon 仅用于只读场景。
 """
-import os, json, urllib.request, urllib.parse, urllib.error, ssl
+import json
+import os
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
 
 CONFIG_PATHS = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".supabase.env"),

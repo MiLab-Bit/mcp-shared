@@ -8,8 +8,11 @@ mcp_ping.py — 用 MCP streamable-http 协议调用已部署 server，确认 to
 鉴权 server（如 hermes-crawler）需带 token：
   MCP_TOKEN=cr_platform_xxx python mcp_ping.py 8790 target_health
 """
+import json
 import os
-import sys, json, uuid, urllib.request as ur
+import sys
+import urllib.request as ur
+import uuid
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8794"
 BASE = f"http://127.0.0.1:{PORT}/mcp"
@@ -44,7 +47,8 @@ if __name__ == "__main__":
     try:
         r = post(init, {"Mcp-Session-Id": sess, "Accept": "application/json, text/event-stream"})
     except Exception as e:
-        print("initialize FAIL:", e); sys.exit(1)
+        print("initialize FAIL:", e)
+        sys.exit(1)
     print("initialize:", r[:200])
 
     # 2. tools/list
@@ -54,7 +58,8 @@ if __name__ == "__main__":
         r2 = post({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                   {"Mcp-Session-Id": sess, "Accept": "application/json, text/event-stream"})
     except Exception as e:
-        print("tools/list FAIL:", e); sys.exit(1)
+        print("tools/list FAIL:", e)
+        sys.exit(1)
     print("tools/list:", r2[:800])
 
     # 3. 可选调用 tool
