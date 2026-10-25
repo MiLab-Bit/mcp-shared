@@ -1164,3 +1164,167 @@ def test_eastmoney_top_list_cached(monkeypatch):
 
 def test_cache_key_prov_maps_eastmoney():
     assert core._CACHE_KEY_PROV.get("em") == "eastmoney"
+
+
+# ---------- Phase 5：多 token 轮换（quant_token_pool） ----------
+
+def test_prov_tokens_pool_priority(monkeypatch):
+    """pool 有 active 记录 → 多 token（优先于单 token）。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [
+        {"token": "tk_pool_a", "weight": 1, "last_used_at": None},
+        {"token": "tk_pool_b", "weight": 1, "last_used_at": "2026-10-25T00:00:00+00:00"}])
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    assert core._prov_tokens("tushare") == ["tk_pool_a", "tk_pool_b"]
+
+
+def test_prov_tokens_fallback_single(monkeypatch):
+    """pool 查询异常（表未建/RLS）→ 退化 quant_providers 单 token。"""
+    def boom(*a, **k):
+        raise RuntimeError("relation does not exist")
+    monkeypatch.setattr(core.sc, "select", boom)
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    monkeypatch.setattr(core, "_prov_fields",
+                        lambda p: {"token": "tk_single"} if p == "tushare" else {})
+    assert core._prov_tokens("tushare") == ["tk_single"]
+
+
+def test_prov_tokens_pool_empty_falls_back(monkeypatch):
+    """pool 表存在但无记录 → 退化单 token。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [])
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    monkeypatch.setattr(core, "_prov_fields",
+                        lambda p: {"token": "tk_single"} if p == "fred" else {})
+    assert core._prov_tokens("fred") == ["tk_single"]
+
+
+def test_prov_tokens_none(monkeypatch):
+    """pool 空 + 单 token 也无 → 空列表。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [])
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {})
+    assert core._prov_tokens("alltick") == []
+
+
+def test_pick_token_rotates(monkeypatch):
+    """多 token round-robin：3 个循环取，且不抛。"""
+    monkeypatch.setattr(core, "_prov_tokens",
+                        lambda p: ["tk1", "tk2", "tk3"])
+    monkeypatch.setattr(core.sc, "update", lambda *a, **k: {"ok": 1})
+    monkeypatch.setattr(core, "_TOKEN_CURSOR", {})
+    got = [core._pick_token("tushare") for _ in range(4)]
+    assert got == ["tk1", "tk2", "tk3", "tk1"]
+
+
+def test_pick_token_single_no_rotate(monkeypatch):
+    """单 token 直返，不走轮换、不记 last_used_at。"""
+    monkeypatch.setattr(core, "_prov_tokens", lambda p: ["only"])
+    called = []
+    monkeypatch.setattr(core.sc, "update", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(core, "_TOKEN_CURSOR", {})
+    assert core._pick_token("fred") == "only"
+    assert called == []
+
+
+def test_pick_token_records_last_used(monkeypatch):
+    """多 token 轮换时 fire-and-forget 记 last_used_at。"""
+    monkeypatch.setattr(core, "_prov_tokens", lambda p: ["tk1", "tk2"])
+    seen = {}
+    def fake_update(table, match, patch):
+        seen.update(table=table, match=match, patch=patch)
+        return {"ok": 1}
+    monkeypatch.setattr(core.sc, "update", fake_update)
+    monkeypatch.setattr(core, "_TOKEN_CURSOR", {})
+    core._pick_token("alpha_vantage")
+    assert seen["table"] == "quant_token_pool"
+    assert seen["match"] == {"token": "tk1", "status": "active"}
+    assert "last_used_at" in seen["patch"]
+
+
+# ---------- Phase 5：可选 Redis 缓存后端 ----------
+
+class _FakeRedis:
+    """内存 fake：仅实现 _redis_* 用到的接口。"""
+    def __init__(self):
+        self.store = {}
+    def ping(self):
+        return True
+    def get(self, k):
+        return self.store.get(k)
+    def set(self, k, v, ex=None):
+        self.store[k] = v
+    def delete(self, *ks):
+        for k in ks:
+            self.store.pop(k, None)
+    def scan_iter(self, pat):
+        return list(self.store)
+
+
+def _enable_fake_redis(monkeypatch, fake=None):
+    fake = fake or _FakeRedis()
+    monkeypatch.setattr(core, "_REDIS_URL", "redis://fake")
+    monkeypatch.setattr(core, "_redis_checked", True)
+    monkeypatch.setattr(core, "_redis_client", fake)
+    return fake
+
+
+def test_cache_redis_shared_across_instances(monkeypatch):
+    """Redis 模式：进程内清空后，另一"实例"经 Redis 命中（fetcher 不再调）。"""
+    fake = _enable_fake_redis(monkeypatch)
+    calls = []
+    def fetcher():
+        calls.append(1)
+        return {"provider": "x", "v": 1}
+    a = core.cache_get("k1", 60, fetcher)
+    assert a["cache"] == "miss" and len(calls) == 1
+    assert fake.store  # 已写 Redis
+    # 模拟进程内丢失（另一实例/重启），Redis 层仍在
+    with core._CACHE_LOCK:
+        core._CACHE.pop("k1", None)
+    b = core.cache_get("k1", 60, fetcher)
+    assert b["cache"] == "hit" and b["v"] == 1 and len(calls) == 1
+    core.cache_clear()
+    assert not fake.store  # clear 连带清 Redis
+
+
+def test_cache_redis_disabled_by_default(monkeypatch):
+    """REDIS_URL 空 → 纯进程内（现有行为不变）。"""
+    monkeypatch.setattr(core, "_REDIS_URL", "")
+    monkeypatch.setattr(core, "_redis_checked", True)
+    monkeypatch.setattr(core, "_redis_client", None)
+    calls = []
+    def fetcher():
+        calls.append(1)
+        return {"v": 1}
+    a = core.cache_get("k2", 60, fetcher)
+    b = core.cache_get("k2", 60, fetcher)
+    assert a["cache"] == "miss" and b["cache"] == "hit" and len(calls) == 1
+
+
+def test_cache_redis_connect_fail_degrades(monkeypatch):
+    """redis ping 失败 → 静默退化进程内，不抛。"""
+    class _Bad(_FakeRedis):
+        def ping(self):
+            raise ConnectionError("refused")
+    monkeypatch.setattr(core, "_REDIS_URL", "redis://bad")
+    monkeypatch.setattr(core, "_redis_checked", False)
+    monkeypatch.setattr(core, "_redis_client", None)
+    import sys
+    monkeypatch.setitem(sys.modules, "redis", _BadModule(_Bad))
+    calls = []
+    def fetcher():
+        calls.append(1)
+        return {"v": 1}
+    a = core.cache_get("k3", 60, fetcher)
+    assert a["cache"] == "miss" and a["v"] == 1
+    b = core.cache_get("k3", 60, fetcher)
+    assert b["cache"] == "hit" and len(calls) == 1
+
+
+class _BadModule:
+    """伪造 redis 模块：Redis.from_url 返回 ping 失败的 client。"""
+    def __init__(self, client_cls):
+        self._c = client_cls
+    def Redis(self):
+        return self
+    def from_url(self, *a, **k):
+        return self._c()

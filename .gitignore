@@ -18,6 +18,7 @@
 !/ta.py
 !/tests/
 !/check_venv_invariants.sh
+!/docs/
 !/.github/
 !/pyproject.toml
 !/requirements-dev.txt

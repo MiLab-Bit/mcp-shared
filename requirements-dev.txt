@@ -7,3 +7,8 @@ ruff>=0.8
 starlette>=0.37
 httpx>=0.27
 PyYAML>=6.0
+
+# 可选：Redis 缓存后端（Phase 5）。仅当服务配置 REDIS_URL 时才 import，
+# 未装/未配置均静默退化进程内缓存（quant_core._redis）。ECS 需要多实例共享缓存时：
+#   pip install redis  并在 systemd Environment 加 REDIS_URL=redis://127.0.0.1:6379/0
+# redis>=5.0

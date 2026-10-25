@@ -55,6 +55,70 @@ def _prov_fields(provider):
     return json.loads(f) if isinstance(f, str) else (f or {})
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 5：多 token 轮换（quant_token_pool，向后兼容单 token）
+# ═══════════════════════════════════════════════════════════════════════
+TOKEN_POOL_TABLE = "quant_token_pool"
+_TOKEN_POOL_TTL = 30.0  # pool 清单进程内缓存（秒）；表变更 30s 内生效
+_TOKEN_POOL_CACHE = {}   # provider -> (ts, [token, ...])
+_TOKEN_POOL_LOCK = threading.Lock()
+_TOKEN_CURSOR = {}       # provider -> int（进程内 round-robin 游标）
+_TOKEN_CURSOR_LOCK = threading.Lock()
+
+
+def _token_pool_cached(provider):
+    """quant_token_pool 的 active token 清单（进程内缓存 30s）。
+    表不存在/查询异常/无记录 → 空列表（调用方退化单 token，静默容错）。"""
+    now = time.time()
+    with _TOKEN_POOL_LOCK:
+        e = _TOKEN_POOL_CACHE.get(provider)
+        if e is not None and (now - e[0]) < _TOKEN_POOL_TTL:
+            return list(e[1])
+    try:
+        rows = sc.select(TOKEN_POOL_TABLE, columns="token,weight,last_used_at",
+                         eq={"provider": provider, "status": "active"},
+                         order="last_used_at.asc.nullsfirst,weight.desc",
+                         limit=50)
+        toks = [r.get("token") for r in (rows or []) if r.get("token")]
+    except Exception:
+        toks = []  # 表未建/RLS/网络——一律退化，不抛
+    with _TOKEN_POOL_LOCK:
+        _TOKEN_POOL_CACHE[provider] = (now, toks)
+    return list(toks)
+
+
+def _prov_tokens(provider):
+    """provider 的全部可用 token（Phase 5）。
+    pool 有 active 记录 → 多 token（last_used_at 最旧/weight 降序）；
+    否则退化 quant_providers.fields.token 单 token（向后兼容）。
+    返回 [token, ...]（可能为空）。"""
+    pool = _token_pool_cached(provider)
+    if pool:
+        return pool
+    tk = _prov_fields(provider).get("token")
+    return [tk] if tk else []
+
+
+def _pick_token(provider):
+    """轮换选一个 token：单 token 直返；多 token 进程内 round-robin，
+    并 fire-and-forget 记 last_used_at（多实例协同靠池内最旧优先，静默容错）。"""
+    toks = _prov_tokens(provider)
+    if not toks:
+        return ""
+    if len(toks) == 1:
+        return toks[0]
+    with _TOKEN_CURSOR_LOCK:
+        i = _TOKEN_CURSOR.get(provider, 0) % len(toks)
+        _TOKEN_CURSOR[provider] = i + 1
+    chosen = toks[i]
+    try:
+        sc.update(TOKEN_POOL_TABLE, {"token": chosen, "status": "active"},
+                  {"last_used_at": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass  # 记账失败不影响取 token
+    return chosen
+
+
 def _prov_row(provider):
     rows = sc.select(PROV_TABLE, columns="id,name,provider,fields,meta,status",
                      eq={"provider": provider}, limit=1)
@@ -270,7 +334,7 @@ def _check_pattern(value, pattern, what):
 @_structured_errors
 def tushare(api_name: str, params: dict, fields: str = "") -> dict:
     api_name = _check_series_id(api_name, "api_name")
-    tk = _prov_fields("tushare").get("token")
+    tk = _pick_token("tushare")
     if not tk:
         return {"error": "tushare token missing"}
     body = {"api_name": api_name, "token": tk,
@@ -304,7 +368,7 @@ def alpha_vantage(function: str = "GLOBAL_QUOTE", symbol: str = "IBM",
         symbol2 = _check_symbol(symbol2, "symbol2")
     if interval:
         interval = _check_choice(interval, _AV_INTERVALS, "interval")
-    token = _prov_fields("alpha_vantage").get("token")
+    token = _pick_token("alpha_vantage")
     if not token:
         return {"error": "alpha_vantage token missing"}
     prm = {"function": function, "symbol": symbol, "apikey": token}
@@ -330,7 +394,7 @@ def fx_rate(from_c: str = "USD", to_c: str = "CNY") -> dict:
     """外汇汇率（Alpha Vantage CURRENCY_EXCHANGE_RATE）。"""
     from_c = _check_symbol(str(from_c).strip().upper(), "from_currency")
     to_c = _check_symbol(str(to_c).strip().upper(), "to_currency")
-    token = _prov_fields("alpha_vantage").get("token")
+    token = _pick_token("alpha_vantage")
     if not token:
         return {"error": "alpha_vantage token missing"}
     q = up.urlencode({"function": "CURRENCY_EXCHANGE_RATE",
@@ -347,7 +411,7 @@ def fred(series_id: str, limit: int = 10, sort: str = "desc") -> dict:
     series_id = _check_series_id(series_id)
     sort = _check_choice(sort, {"asc", "desc"}, "sort")
     limit = _clamp_limit(limit, 1000)
-    tk = _prov_fields("fred").get("token")
+    tk = _pick_token("fred")
     if not tk:
         return {"error": "fred token missing"}
     prm = {"series_id": series_id, "api_key": tk, "file_type": "json",
@@ -545,7 +609,7 @@ def alltick(query: str = "1.600519", window: str = "day", limit: int = 5) -> dic
     query = _check_symbol(query, "query")
     window = _check_pattern(window, r"^[a-z0-9]{1,12}$", "window")
     limit = _clamp_limit(limit, 100)
-    tk = _prov_fields("alltick").get("token")
+    tk = _pick_token("alltick")
     if not tk:
         return {"error": "alltick token 缺失（请在 Supabase quant_providers 配置）"}
     url = (f"https://quote.alltick.io/quote-stock-b-api/kline?token={tk}"
@@ -912,6 +976,10 @@ def quant_health(sample=200):
     tokens = {}
     for p in ("tushare", "alpha_vantage", "fred", "alltick"):
         try:
+            pool = _token_pool_cached(p)
+            if pool:
+                tokens[p] = {"present": True, "pool": len(pool)}
+                continue
             f = _prov_fields(p) or {}
             tokens[p] = bool(f) and any(
                 v for k, v in f.items()
@@ -982,12 +1050,84 @@ def _cache_observe(key, hit):
         pass
 
 
+# ---- Phase 5：可选 Redis 缓存后端（多实例共享；默认关，进程内不变） ----
+# REDIS_URL 配置且 redis 包可导入且 ping 通 → 启用；
+# 任一环节失败 → 静默退化进程内（向后兼容）。ECS 未装 redis 包时零影响。
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_REDIS_PREFIX = "hermes:quant:cache:"
+_redis_client = None
+_redis_checked = False
+
+
+def _redis():
+    """Redis 客户端（惰性单例）。未启用/不可用返回 None。"""
+    global _redis_client, _redis_checked
+    if _redis_checked:
+        return _redis_client
+    _redis_checked = True
+    if not _REDIS_URL:
+        _lu.log_event("cache_backend", backend="inprocess")
+        return None
+    try:
+        import redis  # type: ignore
+        c = redis.Redis.from_url(_REDIS_URL, decode_responses=True,
+                                 socket_connect_timeout=2, socket_timeout=2)
+        c.ping()
+        _redis_client = c
+        _lu.log_event("cache_backend", backend="redis")
+    except Exception as e:
+        _redis_client = None
+        _lu.log_event("cache_backend", backend="inprocess",
+                      reason=_redact(str(e))[:80])
+    return _redis_client
+
+
+def _redis_get(key, ttl):
+    r = _redis()
+    if r is None:
+        return None
+    try:
+        raw = r.get(_REDIS_PREFIX + key)
+        if raw is None:
+            return None
+        val, exp = json.loads(raw)
+        if time.time() - exp >= ttl:  # TTL 以调用方口径为准
+            return None
+        return val
+    except Exception:
+        return None
+
+
+def _redis_put(key, val, ttl):
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.set(_REDIS_PREFIX + key, json.dumps([val, time.time()], default=str),
+              ex=max(1, int(ttl)))
+    except Exception:
+        pass
+
+
+def _redis_clear():
+    r = _redis()
+    if r is None:
+        return
+    try:
+        keys = list(r.scan_iter(_REDIS_PREFIX + "*"))
+        if keys:
+            r.delete(*keys)
+    except Exception:
+        pass
+
+
 def cache_get(key, ttl, fetcher, *args, **kwargs):
     """TTL 缓存分发器。
     key: 缓存键；ttl: 秒（<=0 关闭缓存，直连 fetcher）；
     fetcher: 可调用（通常是某 adapter），异常原样抛出、不缓存。
     命中且未过期 → 返回副本并标记 cache='hit'，不调用 fetcher；
     未命中/过期 → 调用 fetcher，结果非 error 则缓存并标记 cache='miss'。
+    查找序：进程内 → Redis（Phase 5 可选）→ fetcher；写入双写（进程内+Redis）。
     Phase 1：命中/未中均记 metrics（calls 只算真实出站，缓存维度单列）。"""
     if not ttl or ttl <= 0:
         return fetcher(*args, **kwargs)
@@ -999,10 +1139,21 @@ def cache_get(key, ttl, fetcher, *args, **kwargs):
             out["cache"] = "hit"
             _cache_observe(key, True)
             return out
+    if _REDIS_URL:
+        rv = _redis_get(key, ttl)
+        if rv is not None:
+            with _CACHE_LOCK:
+                _CACHE[key] = (time.time(), rv)
+            out = dict(rv)
+            out["cache"] = "hit"
+            _cache_observe(key, True)
+            return out
     res = fetcher(*args, **kwargs)
     if isinstance(res, dict) and "error" not in res:
         with _CACHE_LOCK:
             _CACHE[key] = (time.time(), res)
+        if _REDIS_URL:
+            _redis_put(key, res, ttl)
         res = dict(res)
         res["cache"] = "miss"
     _cache_observe(key, False)
@@ -1010,9 +1161,10 @@ def cache_get(key, ttl, fetcher, *args, **kwargs):
 
 
 def cache_clear():
-    """清空缓存（测试/运维用）。"""
+    """清空缓存（测试/运维用；含 Redis 层）。"""
     with _CACHE_LOCK:
         _CACHE.clear()
+    _redis_clear()
 
 
 def _ttl(ttl, provider):
@@ -1165,7 +1317,7 @@ def fundamentals(symbol: str = "IBM", kind: str = "OVERVIEW", ttl=None) -> dict:
     kind = (kind or "OVERVIEW").upper()
     if kind not in _VALID_FUND_KINDS:
         return {"error": f"fundamentals kind 无效（支持：{_VALID_FUND_KINDS}）"}
-    token = _prov_fields("alpha_vantage").get("token")
+    token = _pick_token("alpha_vantage")
     if not token:
         return {"error": "alpha_vantage token missing"}
     prm = {"function": kind, "symbol": symbol, "apikey": token}
@@ -1198,7 +1350,7 @@ def alpha_vantage_call(function: str = "GLOBAL_QUOTE", params=None, ttl=None) ->
     """通用 Alpha Vantage 调用（meta-tool）：function 为 AV 函数名，params 为参数字典
     （可含 symbol/interval 等，token 自动注入）。返回原始 data；失败返回 {"error":...}。"""
     function = _check_series_id(function, "function")
-    token = _prov_fields("alpha_vantage").get("token")
+    token = _pick_token("alpha_vantage")
     if not token:
         return {"error": "alpha_vantage token missing"}
     p = params if isinstance(params, dict) else (json.loads(params) if params else {})

@@ -11,6 +11,7 @@ workspace 根级共享模块，被各 mcp-servers 经 sys.path 注入引用。
 | logging_utils.py | quant 结构化日志（Phase 1）：stdlib logging，JSON 行（ts/event/字段），stderr 输出；QUANT_LOG_LEVEL 可调级别 |
 | ta.py | quant 技术指标计算层（Phase 2，纯 Python 零依赖）：sma/ema/macd/rsi/boll/kdj/atr + compute 组合器（吃任意 provider OHLCV）+ parse_indicator_spec；口径同通达信；长度不足输出 None 对齐序列 |
 | mcp_utils.py | MCP 共享工具函数：clamp_limit 统一 limit 入参归一化（1-200 截断，非破坏性） |
+| docs/quant_token_pool.sql | Phase 5 多 token 轮换池建表 SQL（用户侧执行；不执行则退化单 token，向后兼容） |
 | mcp_auth.py | 共享 Bearer 鉴权 + per-key 用量计量（crawler A2 范式通用化；news/events 等经此接入，crawler_auth 为薄包装） |
 | health.sh / mcp_ping.py | 健康检查辅助脚本 |
 | tests/ | 共享模块测试（pytest，Supabase 边界全 monkeypatch） |
@@ -23,4 +24,8 @@ tushare 积分探针（2026-10-25 ECS 实测）：user 接口已下线（40101�
 fina_indicator/index_weight/moneyflow_hsgt/top_list/index_classify/ths_index/moneyflow
 等需更高积分（40203），未开通接口经 quant_call 兜底（返回权限 error）；
 龙虎榜已由东财 datacenter 免费源替补（eastmoney_top_list）。
+Phase 5（2026-10-25）：多 token 轮换 `_prov_tokens/_pick_token`（quant_token_pool 表有
+active 记录即轮换 last_used_at 最旧优先，无则退化单 token，向后兼容）；
+可选 Redis 缓存后端（REDIS_URL 配置 + redis 包可导入才启用，否则进程内，见
+requirements-dev.txt 注释）。
 测试：`/opt/hermes-mcp/venv-mcp/bin/python -m pytest tests/ -q`。
