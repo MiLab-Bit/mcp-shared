@@ -21,6 +21,8 @@ import urllib.parse as up
 import urllib.request as ur
 from datetime import datetime, timezone
 
+import logging_utils as _lu
+import metrics as _metrics
 import supabase_client as sc
 
 QUOTES_TABLE = "quotes"
@@ -68,18 +70,21 @@ def _prov_row(provider):
 # （腾讯/新浪）均先过 _guard_url：scheme 限 http/https + host 白名单，
 # 从源头阻断 SSRF——即便 symbol/参数拼接注入 @/./.. 改变 URL，也在
 # 白名单处被拒（不发请求、不做 DNS）。
-_HTTP_ALLOWED_HOSTS = frozenset({
-    "api.tushare.pro",              # TuShare
-    "www.alphavantage.co",          # Alpha Vantage（行情/外汇/基本面）
-    "api.stlouisfed.org",           # FRED
-    "api.coingecko.com",            # CoinGecko
-    "gamma-api.polymarket.com",     # Polymarket
-    "quote.alltick.io",             # Alltick
-    "qt.gtimg.cn",                  # 腾讯行情
-    "ifzq.gtimg.cn",                # 腾讯分钟 K 线
-    "web.ifzq.gtimg.cn",            # 腾讯日/周/月 K 线
-    "hq.sinajs.cn",                 # 新浪行情
-})
+# host → provider 单一来源：白名单 frozenset 与 Phase 1 观测埋点共用，
+# 新增数据商只需在此登记一次。
+_HOST_PROVIDER = {
+    "api.tushare.pro": "tushare",              # TuShare
+    "www.alphavantage.co": "alpha_vantage",    # Alpha Vantage（行情/外汇/基本面）
+    "api.stlouisfed.org": "fred",              # FRED
+    "api.coingecko.com": "coingecko",          # CoinGecko
+    "gamma-api.polymarket.com": "polymarket",  # Polymarket
+    "quote.alltick.io": "alltick",             # Alltick
+    "qt.gtimg.cn": "tencent",                  # 腾讯行情
+    "ifzq.gtimg.cn": "tencent",                # 腾讯分钟 K 线
+    "web.ifzq.gtimg.cn": "tencent",            # 腾讯日/周/月 K 线
+    "hq.sinajs.cn": "sina",                    # 新浪行情
+}
+_HTTP_ALLOWED_HOSTS = frozenset(_HOST_PROVIDER)
 
 
 def _guard_url(url):
@@ -114,8 +119,20 @@ def _sleep_backoff(attempt):
 def _http(url, timeout=15, method=None, data=None, headers=None, proxy=None):
     """HTTP 请求。proxy: 形如 http://127.0.0.1:7890，走 HTTP 代理（用于被墙源）。
     Phase 0 加固：① SSRF 白名单门禁；② 5xx/传输层错误指数退避重试，
-    4xx/429 不重试；重试耗尽后异常原样上抛（adapter 转结构化 error）。"""
-    _guard_url(url)
+    4xx/429 不重试；重试耗尽后异常原样上抛（adapter 转结构化 error）。
+    Phase 1 观测：出口统一记 metrics（provider 粒度）+ 结构化日志（脱敏）。"""
+    try:
+        u = up.urlparse(str(url))
+        prov = _HOST_PROVIDER.get((u.hostname or "").lower(), "unknown")
+        endpoint = u.path or "/"
+    except Exception:
+        prov, endpoint = "unknown", "/"
+    try:
+        _guard_url(url)
+    except ValueError as e:
+        _observe(prov, endpoint, error=str(e))
+        raise
+    retries = 0
     for attempt in range(_RETRY_MAX + 1):
         req = ur.Request(url, data=data, method=method, headers=headers or {})
         opener = None
@@ -129,7 +146,9 @@ def _http(url, timeout=15, method=None, data=None, headers=None, proxy=None):
                 r = ur.urlopen(req, timeout=timeout)
             with r:
                 body = r.read().decode("utf-8", "replace")
-                return r.status, body, round((time.time() - t0) * 1000)
+                ms = round((time.time() - t0) * 1000)
+                _observe(prov, endpoint, ms, r.status, retries=retries)
+                return r.status, body, ms
         except ur.HTTPError as e:
             # 容错：部分环境/构造下 e.read() 可能抛异常（如 fp 为 None），
             # 此时仅返回状态码 + 空 body，避免把受限源的 4xx/5xx 拖垮整个 adapter（P6 健壮性）。
@@ -137,15 +156,21 @@ def _http(url, timeout=15, method=None, data=None, headers=None, proxy=None):
                 body = e.read().decode("utf-8", "replace")
             except Exception:
                 body = ""
+            ms = round((time.time() - t0) * 1000)
             if e.code in _RETRYABLE_STATUS and attempt < _RETRY_MAX:
                 _sleep_backoff(attempt)
+                retries += 1
                 continue
-            return e.code, body, round((time.time() - t0) * 1000)
-        except (ur.URLError, TimeoutError, ConnectionError, OSError):
+            _observe(prov, endpoint, ms, e.code, retries=retries)
+            return e.code, body, ms
+        except (ur.URLError, TimeoutError, ConnectionError, OSError) as e:
             # 传输层错误（URLError 含超时；socket.timeout 亦为其子类）
+            ms = round((time.time() - t0) * 1000)
             if attempt < _RETRY_MAX:
                 _sleep_backoff(attempt)
+                retries += 1
                 continue
+            _observe(prov, endpoint, ms, None, error=_err(e), retries=retries)
             raise
 
 
@@ -166,6 +191,19 @@ def _redact(text):
 def _err(e, suffix=""):
     """统一错误出口：类型名+消息（过脱敏）+ 可选后缀（如代理说明）。"""
     return _redact(f"{type(e).__name__}: {e}{suffix}")
+
+
+def _observe(provider, endpoint, duration_ms=None, status=None,
+             error="", retries=0, cache=""):
+    """Phase 1 观测出口：metrics + 结构化日志。status>=400 或带 error 记 error；
+    error/url 一律先过 _redact 再落日志；全程静默容错——观测不得影响业务。"""
+    try:
+        ok = status is not None and int(status) < 400
+        _metrics.record(provider, duration_ms, ok=ok, retries=retries)
+        _lu.log_adapter_call(provider, endpoint, cache, duration_ms, status,
+                             error=_redact(error) if error else "")
+    except Exception:
+        pass
 
 
 def _structured_errors(fn):
@@ -446,8 +484,10 @@ def tencent_quote(symbol: str = "600519") -> dict:
         # 腾讯返回为 GBK（含中文名），需 GBK 解码
         pl = HERMES_UA
         req = ur.Request(url, headers=pl)
+        t0 = time.time()
         with ur.urlopen(req, timeout=15) as r:
             raw = r.read().decode("gbk", "replace")
+        _observe("tencent", "/q", round((time.time() - t0) * 1000), 200)
         st = 200
         parsed = _tx_parse(raw)
         if not parsed:
@@ -459,6 +499,7 @@ def tencent_quote(symbol: str = "600519") -> dict:
                 "open": parsed["open"], "prev_close": parsed["prev_close"],
                 "volume": parsed["volume"], "ms": _now()}
     except Exception as e:
+        _observe("tencent", "/q", error=_err(e))
         return {"error": _err(e)}
 
 
@@ -471,8 +512,10 @@ def tencent_batch(symbols: str = "600519,000001") -> dict:
     _guard_url(url)
     try:
         req = ur.Request(url, headers=HERMES_UA)
+        t0 = time.time()
         with ur.urlopen(req, timeout=15) as r:
             body = r.read().decode("gbk", "replace")
+        _observe("tencent", "/q", round((time.time() - t0) * 1000), 200)
         # 每行 v_xxx="..."
         out = {}
         for line in body.split("\n"):
@@ -488,6 +531,7 @@ def tencent_batch(symbols: str = "600519,000001") -> dict:
         return {"provider": "tencent", "symbols": len(lst), "http": 200,
                 "quotes": out, "ms": _now()}
     except Exception as e:
+        _observe("tencent", "/q", error=_err(e))
         return {"error": _err(e)}
 
 
@@ -500,13 +544,16 @@ def _tx_us_full(sym: str) -> str:
     try:
         _guard_url(f"https://qt.gtimg.cn/q={sym}")
         req = ur.Request(f"https://qt.gtimg.cn/q={sym}", headers=HERMES_UA)
+        t0 = time.time()
         with ur.urlopen(req, timeout=10) as r:
             raw = r.read().decode("gbk", "replace")
+        _observe("tencent", "/q", round((time.time() - t0) * 1000), 200)
         parts = raw.split("=", 1)[1].strip().strip(";").strip('"').split("~")
         full = parts[2] if len(parts) > 2 else ""
         if "." in full:
             return "us" + full
-    except Exception:
+    except Exception as e:
+        _observe("tencent", "/q", error=_err(e))
         pass
     return sym
 
@@ -571,8 +618,10 @@ def sina_quote(symbol: str = "sh600519") -> dict:
     try:
         req = ur.Request(url, headers={**HERMES_UA,
                                        "Referer": "https://finance.sina.com.cn/"})
+        t0 = time.time()
         with ur.urlopen(req, timeout=15) as r:
             body = r.read().decode("gbk", "replace")
+        _observe("sina", "/list", round((time.time() - t0) * 1000), 200)
         # var hq_str_sh600519="名称,今开,昨收,现价,最高,最低,买一,卖一,成交量,成交额,日期,时间,...";
         inner = body.split('"', 1)[1].rsplit('"', 1)[0] if '"' in body else ""
         p = inner.split(",")
@@ -586,6 +635,7 @@ def sina_quote(symbol: str = "sh600519") -> dict:
                 "volume": _to_num(p[8]), "amount": _to_num(p[9]),
                 "date": p[30] if len(p) > 30 else "", "change_pct": chg_pct, "ms": _now()}
     except Exception as e:
+        _observe("sina", "/list", error=_err(e))
         return {"error": _err(e)}
 
 
@@ -706,6 +756,44 @@ def quote_health(sample=500):
     }
 
 
+# token 字段判定关键词（仅用于在位状态 bool，绝不回显值）
+_TOKEN_KEY_HINTS = ("token", "key", "secret")
+
+
+def quant_health(sample=200):
+    """Phase 1 舰队健康自检（Agent 可自检）：
+    - quotes_freshness：既有 quote_health 数据新鲜度（quotes 表口径）
+    - metrics：per-provider 出站 metrics（calls/errors/error_rate/缓存命中/延迟 p50/p95）
+    - tokens：各 provider 凭证在位状态（仅 bool，缺失/异常为 null）
+    - cache_entries：进程内 TTL 缓存条目数
+    口径注记：in-process metrics 进程重启归零；判定 degraded = 任一 provider
+    calls>=3 且 error_rate>0.5。"""
+    fresh = quote_health(sample)
+    snap = _metrics.snapshot()
+    tokens = {}
+    for p in ("tushare", "alpha_vantage", "fred", "alltick"):
+        try:
+            f = _prov_fields(p) or {}
+            tokens[p] = bool(f) and any(
+                v for k, v in f.items()
+                if any(h in k.lower() for h in _TOKEN_KEY_HINTS) and v)
+        except Exception:
+            tokens[p] = None
+    provs = snap["providers"]
+    degraded = sorted(p for p, s in provs.items()
+                      if s["calls"] >= 3 and (s["error_rate"] or 0) > 0.5)
+    with _CACHE_LOCK:
+        cache_entries = len(_CACHE)
+    return {
+        "health": "degraded" if degraded else "healthy",
+        "degraded_providers": degraded,
+        "quotes_freshness": fresh,
+        "metrics": snap,
+        "tokens": tokens,
+        "cache_entries": cache_entries,
+    }
+
+
 # ──────────────────────────────────────────────────────────────
 # akshare adapter（P1：免费、无 token；国内源如新浪直连，东方财富等经网络可达性优雅降级）
 # 懒加载：不在模块顶层 import akshare，避免无该包的环境（如 CI runner）import 失败。
@@ -738,12 +826,29 @@ _TTL_DEFAULTS = {
 }
 
 
+# 缓存键前缀 → provider（metrics per-provider 缓存口径）。
+# fx:* 是 alpha_vantage 的汇率限频保护缓存，归 alpha_vantage。
+_CACHE_KEY_PROV = {"tushare": "tushare", "av": "alpha_vantage", "fx": "alpha_vantage",
+                   "fred": "fred", "akshare": "akshare"}
+
+
+def _cache_observe(key, hit):
+    """缓存 lookup 观测：per-provider hit/miss + 结构化日志（key 截断+脱敏）。"""
+    prov = _CACHE_KEY_PROV.get(str(key).split(":", 1)[0], "unknown")
+    try:
+        _metrics.record_cache(prov, hit)
+        _lu.log_cache(prov, _redact(str(key))[:80], hit)
+    except Exception:
+        pass
+
+
 def cache_get(key, ttl, fetcher, *args, **kwargs):
     """TTL 缓存分发器。
     key: 缓存键；ttl: 秒（<=0 关闭缓存，直连 fetcher）；
     fetcher: 可调用（通常是某 adapter），异常原样抛出、不缓存。
     命中且未过期 → 返回副本并标记 cache='hit'，不调用 fetcher；
-    未命中/过期 → 调用 fetcher，结果非 error 则缓存并标记 cache='miss'。"""
+    未命中/过期 → 调用 fetcher，结果非 error 则缓存并标记 cache='miss'。
+    Phase 1：命中/未中均记 metrics（calls 只算真实出站，缓存维度单列）。"""
     if not ttl or ttl <= 0:
         return fetcher(*args, **kwargs)
     now = time.time()
@@ -752,6 +857,7 @@ def cache_get(key, ttl, fetcher, *args, **kwargs):
         if e is not None and (now - e[0]) < ttl:
             out = dict(e[1])
             out["cache"] = "hit"
+            _cache_observe(key, True)
             return out
     res = fetcher(*args, **kwargs)
     if isinstance(res, dict) and "error" not in res:
@@ -759,6 +865,7 @@ def cache_get(key, ttl, fetcher, *args, **kwargs):
             _CACHE[key] = (time.time(), res)
         res = dict(res)
         res["cache"] = "miss"
+    _cache_observe(key, False)
     return res
 
 
@@ -818,13 +925,16 @@ def akshare_call(func: str, params=None, ttl=None) -> dict:
             if fn is None:
                 return {"error": f"akshare 无函数 {func}"}
             p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+            t0 = time.time()
             df = fn(**p)
+            _observe("akshare", func, round((time.time() - t0) * 1000), 200)
             if hasattr(df, "to_dict") and hasattr(df, "columns"):
                 recs = df.head(200).to_dict(orient="records")
                 return {"provider": "akshare", "func": func,
                         "columns": list(df.columns), "count": len(recs), "rows": recs}
             return {"provider": "akshare", "func": func, "data": df}
         except Exception as e:  # akshare 接口易因上游改版 / 网络失效
+            _observe("akshare", func, error=f"akshare.{func}: {type(e).__name__}: {e}")
             return {"error": _redact(f"akshare.{func}: {type(e).__name__}: {e}")}
     if ttl and ttl > 0:
         key = f"akshare:{func}:{json.dumps(params or {}, sort_keys=True, default=str)}"

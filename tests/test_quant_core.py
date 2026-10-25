@@ -6,6 +6,7 @@
 """
 import json
 
+import metrics
 import quant_core as core
 
 # ---------- _as_iso ----------
@@ -725,3 +726,235 @@ def test_adapter_error_message_redacted(monkeypatch):
     out = core.alltick("1.600519")
     assert "SUPERSECRET" not in str(out)
     assert "token=***" in out["error"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1 可观测性：出站埋点（metrics + 结构化日志）+ quant_health 聚合
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_http_records_metrics_on_ok(monkeypatch):
+    """_http 成功出口：provider 从 host 映射，calls+1、errors+0、有延迟样本。"""
+    monkeypatch.setattr(core.ur, "urlopen", lambda req, timeout=None: _FakeResp())
+    metrics.reset()
+    st, body, ms = core._http("http://api.tushare.pro/x", data=b"{}")
+    assert st == 200
+    p = metrics.snapshot()["providers"]["tushare"]
+    assert p["calls"] == 1 and p["errors"] == 0
+    assert p["p50_ms"] is not None and p["p50_ms"] >= 0
+
+
+def test_http_records_metrics_on_http_error(monkeypatch):
+    """5xx 耗尽（retry=0 时首次即终态）记 errors。"""
+    import urllib.error as ue
+    def boom(req, timeout=None):
+        raise ue.HTTPError("http://api.stlouisfed.org", 500, "UE", {}, None)
+    monkeypatch.setattr(core.ur, "urlopen", boom)
+    monkeypatch.setattr(core, "_RETRY_MAX", 0)
+    metrics.reset()
+    st, body, ms = core._http("http://api.stlouisfed.org/fred/series")
+    assert st == 500
+    p = metrics.snapshot()["providers"]["fred"]
+    assert p["calls"] == 1 and p["errors"] == 1 and p["error_rate"] == 1.0
+
+
+def test_http_records_metrics_on_transport_error(monkeypatch):
+    """传输层错误耗尽：记 error 且异常上抛（契约不变）。"""
+    import urllib.error as ue
+    def boom(req, timeout=None):
+        raise ue.URLError("connection reset")
+    monkeypatch.setattr(core.ur, "urlopen", boom)
+    monkeypatch.setattr(core, "_RETRY_MAX", 0)
+    metrics.reset()
+    try:
+        core._http("http://api.tushare.pro/x")
+        raise AssertionError("should raise")
+    except ue.URLError:
+        pass
+    p = metrics.snapshot()["providers"]["tushare"]
+    assert p["calls"] == 1 and p["errors"] == 1
+
+
+def test_http_records_metrics_on_guard_reject(monkeypatch):
+    """SSRF 门禁拒绝（不发请求）也记 error，便于观测误用/攻击。"""
+    metrics.reset()
+    try:
+        core._http("https://evil.example.com/x")
+        raise AssertionError("should raise")
+    except ValueError:
+        pass
+    p = metrics.snapshot()["providers"]["unknown"]
+    assert p["calls"] == 1 and p["errors"] == 1
+    assert p["p50_ms"] is None  # 未触网，无延迟样本
+
+
+def test_http_retries_counted_in_metrics(monkeypatch):
+    """5xx 重试后成功：retries 计入，calls 只记终态一次（不重复计数 attempt）。"""
+    import urllib.error as ue
+    seq = iter([ue.HTTPError("http://api.tushare.pro", 503, "UE", {}, None),
+                ue.HTTPError("http://api.tushare.pro", 502, "UE", {}, None),
+                _FakeResp()])
+    def fake(req, timeout=None):
+        item = next(seq)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    metrics.reset()
+    st, body, ms = core._http("http://api.tushare.pro/x")
+    assert st == 200
+    p = metrics.snapshot()["providers"]["tushare"]
+    assert p["calls"] == 1 and p["retries"] == 2 and p["errors"] == 0
+
+
+def test_direct_connect_records_metrics(monkeypatch):
+    """腾讯直连 urlopen（不过 _http）也要埋点。"""
+    monkeypatch.setattr(core.ur, "urlopen",
+                        lambda req, timeout=None: _FakeGBKResp(_fake_tx_line()))
+    metrics.reset()
+    out = core.tencent_quote("600519")
+    assert "error" not in out
+    p = metrics.snapshot()["providers"]["tencent"]
+    assert p["calls"] == 1 and p["errors"] == 0
+
+
+def test_direct_connect_error_records_metrics(monkeypatch):
+    import urllib.error as ue
+    def boom(req, timeout=None):
+        raise ue.URLError("tencent down")
+    monkeypatch.setattr(core.ur, "urlopen", boom)
+    metrics.reset()
+    out = core.tencent_quote("600519")
+    assert "error" in out
+    p = metrics.snapshot()["providers"]["tencent"]
+    assert p["calls"] == 1 and p["errors"] == 1
+
+
+def test_sina_quote_records_metrics(monkeypatch):
+    """新浪直连埋点 + GBK 解析（走既有 fake）。"""
+    body = ('var hq_str_sh600519="贵州茅台,今开,昨收,现价,最高,最低,'
+            '买一,卖一,成交量,成交额,日期,时间";').encode("gbk")
+    class _R:
+        def read(self):
+            return body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(core.ur, "urlopen", lambda req, timeout=None: _R())
+    metrics.reset()
+    out = core.sina_quote("sh600519")
+    assert "error" not in out
+    p = metrics.snapshot()["providers"]["sina"]
+    assert p["calls"] == 1 and p["errors"] == 0
+
+
+def test_cache_get_records_hit_and_miss(monkeypatch):
+    """cache_get：未命中记 miss + 触发 fetcher；命中记 hit 且不触 fetcher。"""
+    core.cache_clear()
+    metrics.reset()
+    calls = {"n": 0}
+    def fetcher():
+        calls["n"] += 1
+        return {"provider": "x", "data": 1}
+    r1 = core.cache_get("fred:GDP:10:desc", 60, fetcher)
+    r2 = core.cache_get("fred:GDP:10:desc", 60, fetcher)
+    assert r1["cache"] == "miss" and r2["cache"] == "hit"
+    assert calls["n"] == 1
+    p = metrics.snapshot()["providers"]["fred"]
+    assert p["cache_misses"] == 1 and p["cache_hits"] == 1
+    # 缓存未贡献 calls（只算真实出站）
+    assert p["calls"] == 0
+
+
+def test_cache_key_provider_mapping():
+    """fx:* 键归 alpha_vantage（AV 汇率限频缓存）；未知前缀归 unknown。"""
+    assert core._CACHE_KEY_PROV["fx"] == "alpha_vantage"
+    assert core._CACHE_KEY_PROV["av"] == "alpha_vantage"
+    assert core._CACHE_KEY_PROV["tushare"] == "tushare"
+    assert "bogus" not in core._CACHE_KEY_PROV
+
+
+def test_fred_cached_records_cache_metrics(monkeypatch):
+    """cached wrapper 端到端：miss→hit 且 fetcher 只跑一次（真实出站只记一次）。"""
+    monkeypatch.setattr(core, "fred", lambda *a, **k: {"provider": "fred", "data": [1]})
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {"api_key": "x"})
+    core.cache_clear()
+    metrics.reset()
+    r1 = core.fred_cached("GDP", 10)
+    r2 = core.fred_cached("GDP", 10)
+    assert r1["cache"] == "miss" and r2["cache"] == "hit"
+    snap = metrics.snapshot()
+    assert snap["providers"]["fred"]["cache_hits"] == 1
+    assert snap["providers"]["fred"]["cache_misses"] == 1
+    assert snap["totals"]["cache_hit_rate"] == 0.5
+
+
+def test_quant_health_aggregates(monkeypatch):
+    """quant_health：聚合 quotes 新鲜度 + metrics + tokens(bool) + 缓存规模。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    rows = [{"provider": "tushare", "symbol": "600519.SH", "dtype": "price",
+             "as_of": (now - timedelta(hours=2)).isoformat()}]
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: list(rows))
+    monkeypatch.setattr(core, "_prov_fields",
+                        lambda p: {"token": "x"} if p in ("tushare", "alltick") else {})
+    metrics.reset()
+    metrics.record("tushare", 10.0, ok=True)
+    metrics.record("tushare", 12.0, ok=False)
+    core.cache_clear()
+    h = core.quant_health()
+    assert h["health"] == "healthy"  # error_rate=0.5 未过 0.5 阈值（calls=2<3）
+    assert h["degraded_providers"] == []
+    # quotes 新鲜度透传
+    assert h["quotes_freshness"]["health"] == "healthy"
+    assert h["quotes_freshness"]["providers"][0]["provider"] == "tushare"
+    # metrics 透传
+    assert h["metrics"]["providers"]["tushare"]["calls"] == 2
+    assert h["metrics"]["providers"]["tushare"]["errors"] == 1
+    # token 仅 bool
+    assert h["tokens"]["tushare"] is True
+    assert h["tokens"]["alpha_vantage"] is False
+    assert isinstance(h["tokens"]["fred"], bool)
+    assert h["cache_entries"] == 0
+
+
+def test_quant_health_degraded_on_provider_errors(monkeypatch):
+    """provider error_rate>0.5 且 calls>=3 → overall degraded 并点名。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [])
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {})
+    metrics.reset()
+    for ok in (False, False, True):  # 3 calls, 2 errors → rate 0.667
+        metrics.record("coingecko", 5.0, ok=ok)
+    h = core.quant_health()
+    assert h["health"] == "degraded"
+    assert "coingecko" in h["degraded_providers"]
+
+
+def test_quant_health_token_unknown_on_db_failure(monkeypatch):
+    """token 查询异常 → null（不炸整体 health）。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [])
+    def boom(p):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(core, "_prov_fields", boom)
+    h = core.quant_health()
+    assert all(v is None for v in h["tokens"].values())
+
+
+def test_observe_redacts_error_in_log(monkeypatch):
+    """观测出口的 error 必须脱敏（防 token 经结构化日志泄露）。"""
+    h_lines = []
+    import logging
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            h_lines.append(record.getMessage())
+    hd = _Collect()
+    core._lu._LOG.addHandler(hd)
+    try:
+        core._observe("alltick", "/kline", error="URLError: https://quote.alltick.io/kline?token=SUPERSECRET x")
+    finally:
+        core._lu._LOG.removeHandler(hd)
+    import json as _json
+    d = _json.loads(h_lines[0])
+    assert "SUPERSECRET" not in d["error"]
+    assert "token=***" in d["error"]

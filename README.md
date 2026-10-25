@@ -6,7 +6,9 @@ workspace 根级共享模块，被各 mcp-servers 经 sys.path 注入引用。
 |---|---|
 | db.py | 业务数据适配层：Supabase 优先；创业情报/UTM 有本地 JSON 回退，爬虫数据无回退 |
 | supabase_client.py | 零依赖 Supabase REST 客户端；凭证链：环境变量 > .supabase.env > /opt/shared/supabase.env |
-| quant_core.py | quant 家族共享核心：TuShare/FRED/AV/Alltick 适配 + sina/em/tx 直连接口；Phase 0 加固（SSRF 主机白名单 _guard_url / 5xx+传输层重试退避 / 输入校验 _check_* / 密钥脱敏 _redact）；黄金测试在 mcp-quant 仓库 |
+| quant_core.py | quant 家族共享核心：TuShare/FRED/AV/Alltick 适配 + sina/em/tx 直连接口；Phase 0 加固（SSRF 主机白名单 _guard_url / 5xx+传输层重试退避 / 输入校验 _check_* / 密钥脱敏 _redact）；Phase 1 观测（出站埋点 _observe + quant_health 聚合）；黄金测试在 mcp-quant 仓库 |
+| metrics.py | quant 舰队 in-process 指标（Phase 1）：per-provider 出站 calls/errors/retries/error_rate/缓存 hit/miss/延迟 p50/p95；零依赖、线程安全、静默容错 |
+| logging_utils.py | quant 结构化日志（Phase 1）：stdlib logging，JSON 行（ts/event/字段），stderr 输出；QUANT_LOG_LEVEL 可调级别 |
 | mcp_utils.py | MCP 共享工具函数：clamp_limit 统一 limit 入参归一化（1-200 截断，非破坏性） |
 | mcp_auth.py | 共享 Bearer 鉴权 + per-key 用量计量（crawler A2 范式通用化；news/events 等经此接入，crawler_auth 为薄包装） |
 | health.sh / mcp_ping.py | 健康检查辅助脚本 |
