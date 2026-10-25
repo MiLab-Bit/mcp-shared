@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# 与舰队三服务一致：E/W pycodestyle · F pyflakes · I isort（CI 门禁最小高收益集）
+# E402 忽略：共享模块经 sys.path.insert 注入（tests/conftest 与各服务 bootstrap），
+# 该模式在核心模块与测试中刻意存在，非代码坏味道。
+select = ["E", "F", "W", "I"]
+ignore = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

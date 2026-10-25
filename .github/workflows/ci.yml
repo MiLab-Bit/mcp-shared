@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # 共享层首次纳入 lint 门禁（历史债已清零：All checks passed）
+      - name: Ruff lint
+        run: ruff check .
+
+      # 覆盖 db / mcp_asgi / mcp_auth / mcp_usage / mcp_utils / quant_core 黄金测试
+      - name: Pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest -q tests

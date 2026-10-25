@@ -13,4 +13,7 @@
 !/mcp_auth.py
 !/tests/
 !/check_venv_invariants.sh
+!/.github/
+!/pyproject.toml
+!/requirements-dev.txt
 tests/__pycache__/

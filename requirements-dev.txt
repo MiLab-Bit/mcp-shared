@@ -1,0 +1,9 @@
+# mcp-shared 开发/CI 依赖
+# 运行时：quant_core / db / supabase_client 仅 stdlib+本地；akshare 等重依赖由消费方
+# 服务按需安装、共享层懒加载。但 mcp_asgi(健康检查 ASGI) / mcp_auth(YAML 配置) 及其
+# 测试需要下列包，故列入 dev。
+pytest>=8.0
+ruff>=0.8
+starlette>=0.37
+httpx>=0.27
+PyYAML>=6.0
