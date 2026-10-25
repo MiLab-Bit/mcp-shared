@@ -958,3 +958,149 @@ def test_observe_redacts_error_in_log(monkeypatch):
     d = _json.loads(h_lines[0])
     assert "SUPERSECRET" not in d["error"]
     assert "token=***" in d["error"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3：元工具扩展（frankfurter/coingecko adapters + 路由 + catalog）
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_frankfurter_adapter_parses_v2_array(monkeypatch):
+    """frankfurter v2：数组响应 → 逐日 rates；日期归一 + 默认近 90 天。"""
+    body = ('[{"date":"2026-10-20","base":"USD","quote":"CNY","rate":6.6752},'
+            '{"date":"2026-10-21","base":"USD","quote":"CNY","rate":6.6727}]')
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, body, 12))
+    out = core.frankfurter("USD", "CNY", "20261020", "20261021")
+    assert out["count"] == 2 and out["base"] == "USD"
+    assert out["rates"][0] == {"date": "2026-10-20", "rate": 6.6752}
+    assert out["start"] == "2026-10-20" and out["end"] == "2026-10-21"
+
+
+def test_frankfurter_whitelisted_and_guard():
+    """frankfurter 域名在 SSRF 白名单。"""
+    assert "api.frankfurter.dev" in core._HTTP_ALLOWED_HOSTS
+    assert core._HOST_PROVIDER["api.frankfurter.dev"] == "frankfurter"
+
+
+def test_frankfurter_empty_rates_error(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, "[]", 5))
+    out = core.frankfurter("USD", "XXX")
+    assert "error" in out and "无数据" in out["error"]
+
+
+def test_frankfurter_bad_currency_rejected():
+    out = core.frankfurter("US D!", "CNY")
+    assert "error" in out  # _check_symbol 拒绝 → _structured_errors 结构化
+
+
+def test_coingecko_ohlc_parses_and_proxies(monkeypatch):
+    """OHLC：数组 5 列 → records；必须走代理（PROXY 传递）。"""
+    body = ('[[1729468800000,63200.0,63500.0,63000.0,63300.0],'
+            '[1729472400000,63300.0,63400.0,63100.0,63200.0]]')
+    seen = {}
+    def fake(url, *a, **k):
+        seen["url"] = url
+        seen["proxy"] = k.get("proxy")
+        return 200, body, 9
+    monkeypatch.setattr(core, "_http", fake)
+    out = core.coingecko_ohlc("bitcoin", "usd", 30)
+    assert out["count"] == 2 and out["days"] == 30
+    assert out["ohlc"][0]["open"] == 63200.0
+    assert "/api/v3/coins/bitcoin/ohlc" in seen["url"]
+    assert seen["proxy"] == core.PROXY  # coingecko 恒走代理
+
+
+def test_coingecko_ohlc_bad_days_rejected():
+    out = core.coingecko_ohlc("bitcoin", "usd", 45)
+    assert "error" in out  # days 仅允许 1/7/14/30/90/180/365/max
+
+
+def test_coingecko_markets_parses(monkeypatch):
+    body = ('[{"id":"bitcoin","symbol":"btc","current_price":63000.0,'
+            '"market_cap":1.2e12,"total_volume":1.0e10,'
+            '"price_change_percentage_24h":-1.2,"last_updated":"2026-10-25T00:00:00Z"}]')
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, body, 8))
+    out = core.coingecko_markets("usd", "bitcoin", 20)
+    assert out["count"] == 1
+    m = out["markets"][0]
+    assert m["symbol"] == "btc" and m["current_price"] == 63000.0
+
+
+def test_quant_call_routes_registered():
+    """Phase 3 路由表：6 provider 齐注册。"""
+    assert set(core._QUANT_CALL_ROUTES) == {
+        "akshare", "alpha_vantage", "fred", "tushare", "coingecko", "frankfurter"}
+
+
+def test_quant_call_fred_sort_passthrough(monkeypatch):
+    """回归：fred 路由旧 lambda 丢 sort 参数；现在透传 asc/desc。"""
+    seen = {}
+    def fake(series_id, limit=10, sort="desc"):
+        seen["series_id"] = series_id
+        seen["limit"] = limit
+        seen["sort"] = sort
+        return {"provider": "fred", "observations": []}
+    monkeypatch.setattr(core, "fred", fake)
+    core.quant_call("fred", "GDP", {"sort": "asc", "limit": 5})
+    assert seen == {"series_id": "GDP", "limit": 5, "sort": "asc"}
+
+
+def test_quant_call_tushare_fields_passthrough(monkeypatch):
+    seen = {}
+    def fake(api_name, params, fields=""):
+        seen["api_name"] = api_name
+        seen["fields"] = fields
+        return {"provider": "tushare"}
+    monkeypatch.setattr(core, "tushare", fake)
+    core.quant_call("tushare", "daily", {"fields": "ts_code,close"})
+    assert seen["api_name"] == "daily"
+    assert seen["fields"] == "ts_code,close"
+
+
+def test_quant_call_frankfurter_route(monkeypatch):
+    seen = {}
+    def fake(from_c, to_c, start="", end=""):
+        seen.update(from_c=from_c, to_c=to_c, start=start, end=end)
+        return {"provider": "frankfurter", "rates": []}
+    monkeypatch.setattr(core, "frankfurter", fake)
+    out = core.quant_call("frankfurter", "USD",
+                          {"to_c": "CNY", "start": "20260101", "end": "20261025"})
+    assert out["provider"] == "frankfurter"
+    assert seen == {"from_c": "USD", "to_c": "CNY",
+                    "start": "20260101", "end": "20261025"}
+
+
+def test_quant_call_coingecko_endpoint_dispatch(monkeypatch):
+    """coingecko 路由按 endpoint 分派 ohlc/markets/price；未知 endpoint 报错。"""
+    seen = {}
+    monkeypatch.setattr(core, "coingecko_ohlc",
+                        lambda *a, **k: seen.update(kind="ohlc") or {"provider": "coingecko"})
+    monkeypatch.setattr(core, "coingecko_markets",
+                        lambda *a, **k: seen.update(kind="markets") or {"provider": "coingecko"})
+    monkeypatch.setattr(core, "coingecko",
+                        lambda *a, **k: seen.update(kind="price") or {"provider": "coingecko"})
+    core.quant_call("coingecko", "ohlc", {"id": "bitcoin"})
+    core.quant_call("coingecko", "markets", {"vs": "usd"})
+    core.quant_call("coingecko", "price", {"ids": "bitcoin"})
+    assert seen["kind"] == "price"
+    out = core.quant_call("coingecko", "bogus", {})
+    assert "error" in out and "不支持" in out["error"]
+
+
+def test_quant_catalog_completeness():
+    """catalog：10 provider 齐、字段全、quant_call 标记与路由表一致。"""
+    c = core.quant_catalog()
+    assert c["count"] == 10
+    provs = {p["provider"] for p in c["providers"]}
+    assert provs == {"tencent", "sina", "frankfurter", "tushare", "alpha_vantage",
+                     "fred", "akshare", "coingecko", "polymarket", "alltick"}
+    for p in c["providers"]:
+        assert {"provider", "endpoints", "desc", "auth", "reachable",
+                "tools", "quant_call"} <= set(p)
+    # quant_call=True 的 provider 必须都在路由表里
+    for p in c["providers"]:
+        if p["quant_call"]:
+            assert p["provider"] in core._QUANT_CALL_ROUTES
+    # 路由表里可调度的都在 catalog 标注
+    for prov in core._QUANT_CALL_ROUTES:
+        entry = next(p for p in c["providers"] if p["provider"] == prov)
+        assert entry["quant_call"] is True

@@ -83,6 +83,7 @@ _HOST_PROVIDER = {
     "ifzq.gtimg.cn": "tencent",                # 腾讯分钟 K 线
     "web.ifzq.gtimg.cn": "tencent",            # 腾讯日/周/月 K 线
     "hq.sinajs.cn": "sina",                    # 新浪行情
+    "api.frankfurter.dev": "frankfurter",      # Frankfurter 外汇历史（免费无 key）
 }
 _HTTP_ALLOWED_HOSTS = frozenset(_HOST_PROVIDER)
 
@@ -394,6 +395,98 @@ def polymarket(limit: int = 5) -> dict:
         d = json.loads(b)
         return {"provider": "polymarket", "http": st, "events_count": len(d),
                 "events": d[:limit], "ms": ms}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {PROXY}）")}
+
+
+# ---------------- Frankfurter（免费无 key 外汇历史，v2 API） ----------------
+
+
+@_structured_errors
+def frankfurter(from_c: str = "USD", to_c: str = "CNY",
+                start: str = "", end: str = "") -> dict:
+    """外汇历史汇率（Frankfurter v2，免费无 key，恒可达）。
+    start/end: YYYY-MM-DD 或 YYYYMMDD，可空（空 → 近 90 天）。
+    返回逐日 [{"date","rate"}]，最多回 200 条。"""
+    from_c = _check_symbol(str(from_c).strip().upper(), "from_currency")
+    to_c = _check_symbol(str(to_c).strip().upper(), "to_currency")
+
+    def _norm_date(s, what):
+        if not s:
+            return ""
+        d = _check_date(s, what).replace("-", "")
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    start, end = _norm_date(start, "start"), _norm_date(end, "end")
+    if not start or not end:
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        end = end or today.isoformat()
+        start = start or (today - timedelta(days=90)).isoformat()
+    url = (f"https://api.frankfurter.dev/v2/rates?from={start}&to={end}"
+           f"&base={from_c}&quotes={to_c}")
+    try:
+        st, b, ms = _http(url, headers=HERMES_UA)
+        d = json.loads(b)
+        out = [{"date": r.get("date"), "rate": r.get("rate")}
+               for r in d if isinstance(r, dict)]
+        if not out:
+            return {"error": f"frankfurter 无数据 {from_c}->{to_c} {start}..{end}",
+                    "http": st}
+        return {"provider": "frankfurter", "base": from_c, "quote": to_c,
+                "http": st, "count": len(out), "rates": out[-200:],
+                "start": out[0]["date"], "end": out[-1]["date"], "ms": ms}
+    except Exception as e:
+        return {"error": _err(e)}
+
+
+# ---------------- CoinGecko 扩展（走 mihomo 代理） ----------------
+
+
+@_structured_errors
+def coingecko_ohlc(id: str = "bitcoin", vs: str = "usd", days: int = 30) -> dict:
+    """CoinGecko OHLC K线（走代理）。days: 1/7/14/30/90/180/365/max。
+    返回 [{"ts","open","high","low","close"}]，最多 200 条。"""
+    id = _check_pattern(id, r"^[a-z0-9-]{1,40}$", "id")
+    vs = _check_pattern(vs, r"^[a-z]{3,10}$", "vs_currency")
+    days = _check_choice(str(days), {"1", "7", "14", "30", "90", "180",
+                                     "365", "max"}, "days")
+    url = (f"https://api.coingecko.com/api/v3/coins/{id}/ohlc"
+           f"?vs_currency={vs}&days={days}")
+    try:
+        st, b, ms = _http(url, proxy=PROXY, headers=HERMES_UA)
+        d = json.loads(b)
+        out = [{"ts": r[0], "open": r[1], "high": r[2], "low": r[3],
+                "close": r[4]} for r in d
+               if isinstance(r, list) and len(r) >= 5]
+        if not out:
+            return {"error": f"coingecko OHLC 无数据 id={id} days={days}", "http": st}
+        return {"provider": "coingecko", "id": id, "vs": vs,
+                "days": int(days) if days.isdigit() else days,
+                "http": st, "count": len(out), "ohlc": out[-200:], "ms": ms}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {PROXY}）")}
+
+
+@_structured_errors
+def coingecko_markets(vs: str = "usd", ids: str = "bitcoin,ethereum",
+                      limit: int = 20) -> dict:
+    """CoinGecko 市场列表（市值降序，走代理）。ids 逗号分隔币 id。"""
+    vs = _check_pattern(vs, r"^[a-z]{3,10}$", "vs_currency")
+    ids = _check_pattern(ids, r"^[a-z0-9,-]{1,200}$", "ids")
+    limit = _clamp_limit(limit, 100)
+    url = (f"https://api.coingecko.com/api/v3/coins/markets?vs_currency={vs}"
+           f"&ids={ids}&order=market_cap_desc&per_page={limit}&page=1")
+    try:
+        st, b, ms = _http(url, proxy=PROXY, headers=HERMES_UA)
+        d = json.loads(b)
+        out = [{"id": c.get("id"), "symbol": c.get("symbol"),
+                "current_price": c.get("current_price"),
+                "market_cap": c.get("market_cap"),
+                "total_volume": c.get("total_volume"),
+                "price_change_percentage_24h": c.get("price_change_percentage_24h"),
+                "last_updated": c.get("last_updated")} for c in d]
+        return {"provider": "coingecko", "vs": vs, "http": st,
+                "count": len(out), "markets": out, "ms": ms}
     except Exception as e:
         return {"error": _err(e, f"（经代理 {PROXY}）")}
 
@@ -1086,12 +1179,33 @@ def alpha_vantage_call(function: str = "GLOBAL_QUOTE", params=None, ttl=None) ->
     return _fetch()
 
 
-# 元工具路由表：provider -> dispatch(endpoint, params)
+# 元工具路由表（Phase 3 配置驱动）：provider -> dispatch(endpoint, params)
+# fred 透传 limit+sort（Phase 3 修复：旧 lambda 丢 sort 参数）；
+# tushare 透传 fields；coingecko 按 endpoint 分派 price/ohlc/markets。
 _QUANT_CALL_ROUTES = {
     "akshare": lambda ep, p: akshare_call(ep, p),
     "alpha_vantage": lambda ep, p: alpha_vantage_call(ep, p),
-    "fred": lambda ep, p: fred_cached(ep, limit=(p or {}).get("limit", 10)
-                                      if isinstance(p, dict) else 10),
+    "fred": lambda ep, p: fred_cached(
+        ep,
+        limit=(p or {}).get("limit", 10) if isinstance(p, dict) else 10,
+        sort=(p or {}).get("sort", "desc") if isinstance(p, dict) else "desc"),
+    "tushare": lambda ep, p: tushare_cached(
+        ep, p,
+        (p or {}).get("fields", "") if isinstance(p, dict) else ""),
+    "coingecko": lambda ep, p: {
+        "price": lambda: coingecko((p or {}).get("ids", "bitcoin"),
+                                   (p or {}).get("vs", "usd")),
+        "ohlc": lambda: coingecko_ohlc((p or {}).get("id", "bitcoin"),
+                                       (p or {}).get("vs", "usd"),
+                                       (p or {}).get("days", 30)),
+        "markets": lambda: coingecko_markets((p or {}).get("vs", "usd"),
+                                             (p or {}).get(
+                                                 "ids", "bitcoin,ethereum")),
+    }.get(ep, lambda: {"error": f"coingecko endpoint 不支持: {ep}"
+                                "（price/ohlc/markets）"})(),
+    "frankfurter": lambda ep, p: frankfurter(
+        ep, (p or {}).get("to_c", "CNY"),
+        (p or {}).get("start", ""), (p or {}).get("end", "")),
 }
 
 
@@ -1099,9 +1213,12 @@ _QUANT_CALL_ROUTES = {
 def quant_call(provider: str = "akshare", endpoint: str = "stock_zh_a_daily",
                params=None) -> dict:
     """元工具：统一入口调度各 provider 的通用 endpoint，收敛工具面、便于扩源。
-    provider: akshare / alpha_vantage / fred；endpoint: 该 provider 的接口名/函数名；
-    params: 参数字典或 JSON 字符串。
-    例：quant_call("alpha_vantage","TIME_SERIES_DAILY",{"symbol":"IBM"})。
+    provider: akshare / alpha_vantage / fred / tushare / coingecko / frankfurter；
+    endpoint: 该 provider 的接口名/函数名（coingecko 为 price/ohlc/markets，
+    frankfurter 为 from 币种如 USD）；params: 参数字典或 JSON 字符串。
+    例：quant_call("alpha_vantage","TIME_SERIES_DAILY",{"symbol":"IBM"})；
+        quant_call("fred","GDP",{"sort":"asc","limit":5})；
+        quant_call("frankfurter","USD",{"to_c":"CNY","start":"20260101"})。
     未知 provider 返回 {"error":...} 而非抛异常。"""
     endpoint = _check_series_id(endpoint, "endpoint")
     if provider not in _QUANT_CALL_ROUTES:
@@ -1113,3 +1230,67 @@ def quant_call(provider: str = "akshare", endpoint: str = "stock_zh_a_daily",
     except Exception as e:
         return {"error": _redact(f"quant_call.{provider}.{endpoint}: {type(e).__name__}: {e}")}
 
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3：能力目录（发现式）——quant_catalog 工具数据源
+# reachable 口径：河源 ECS 实测（2026-10-05 连通性普查 + 2026-10-24 tx 换源）
+#   yes    = 直连可达
+#   proxy  = 需经 mihomo 代理（:7890）
+#   token  = 凭证缺失/失效，需在 Supabase quant_providers 配置
+# ═══════════════════════════════════════════════════════════════════════
+_PROVIDER_CATALOG = [
+    {"provider": "tencent", "endpoints": "quote / batch / kline(日周月分钟)",
+     "desc": "腾讯行情与K线（免费主力：A股/美股/港股/指数）",
+     "auth": "无", "reachable": "yes",
+     "tools": "tx_quote / tx_batch / tx_kline / stock_indicators",
+     "quant_call": False},
+    {"provider": "sina", "endpoints": "quote",
+     "desc": "新浪行情（备用免费源：A股/美股/港股，需 Referer）",
+     "auth": "无", "reachable": "yes",
+     "tools": "sina_quote", "quant_call": False},
+    {"provider": "frankfurter", "endpoints": "rates(历史) / rate(最新)",
+     "desc": "外汇历史汇率（228 币种，回溯 1948，日频）",
+     "auth": "无（免费无 key）", "reachable": "yes",
+     "tools": "（经 quant_call）", "quant_call": True},
+    {"provider": "tushare", "endpoints": "<api_name>（daily / trade_cal / index_daily / stock_basic 等）",
+     "desc": "TuShare 全量 A股/指数/基本面数据（积分制，超档接口需积分）",
+     "auth": "token（Supabase quant_providers，积分制）", "reachable": "yes",
+     "tools": "get_stock_daily / fetch_tushare / get_trade_calendar / get_index_daily",
+     "quant_call": True},
+    {"provider": "alpha_vantage",
+     "endpoints": "GLOBAL_QUOTE / TIME_SERIES_DAILY / CURRENCY_EXCHANGE_RATE / 基本面四表 等",
+     "desc": "美股报价/指数/外汇/基本面（每日 25 次免费）",
+     "auth": "token（Supabase quant_providers）", "reachable": "yes",
+     "tools": "get_us_quote / get_index / get_fx_rate / get_fundamentals",
+     "quant_call": True},
+    {"provider": "fred", "endpoints": "<series_id>（GDP / CPILFESL / UNRATE / DFF 等）",
+     "desc": "美联储经济数据宏观序列",
+     "auth": "token（Supabase quant_providers）", "reachable": "yes",
+     "tools": "get_macro_series", "quant_call": True},
+    {"provider": "akshare", "endpoints": "<func>（stock_zh_a_daily / stock_hk_hist / fund_etf_hist_em 等）",
+     "desc": "AKShare 全量封装（A股/港股/ETF/资金流/宏观；部分源经网络可达性优雅降级）",
+     "auth": "无（免费）", "reachable": "yes",
+     "tools": "ak_stock_hist / ak_hk_hist / ak_etf_hist / ak_fund_flow / ak_macro / ak_call",
+     "quant_call": True},
+    {"provider": "coingecko", "endpoints": "price / ohlc / markets",
+     "desc": "加密行情/OHLC/市场列表（免费档限频约 10-30 次/分）",
+     "auth": "无（免费档）", "reachable": "proxy",
+     "tools": "（经 quant_call）", "quant_call": True},
+    {"provider": "polymarket", "endpoints": "events",
+     "desc": "预测市场事件（Polymarket Gamma）",
+     "auth": "无", "reachable": "proxy",
+     "tools": "（经 quant_call，alt 仓）", "quant_call": False},
+    {"provider": "alltick", "endpoints": "kline（实时K线）",
+     "desc": "Alltick 实时行情（加密/美股）",
+     "auth": "token（当前失效待重签）", "reachable": "token",
+     "tools": "（alt 仓）", "quant_call": False},
+]
+
+
+def quant_catalog():
+    """能力目录（Phase 3 发现式）：provider/endpoint/说明/凭证/可达性一览。
+    Agent 不必硬记接口名——先查目录再调 quant_call。"""
+    return {"providers": _PROVIDER_CATALOG, "count": len(_PROVIDER_CATALOG),
+            "note": "reachable: yes=直连可达 / proxy=需 mihomo 代理 / "
+                    "token=凭证缺失或失效待配置；quant_call=True 表示可经元工具调度"}
