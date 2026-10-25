@@ -109,7 +109,7 @@ class _FakeResp:
 
 def test_http_ok(monkeypatch):
     monkeypatch.setattr(core.ur, "urlopen", lambda req, timeout=None: _FakeResp())
-    st, body, ms = core._http("http://example.com")
+    st, body, ms = core._http("http://api.tushare.pro/ping")
     assert st == 200 and json.loads(body)["ok"] is True and ms >= 0
 
 
@@ -118,7 +118,7 @@ def test_http_http_error_returns_code(monkeypatch):
     def raise_he(req, timeout=None):
         raise ue.HTTPError("http://x", 404, "NF", {}, None)
     monkeypatch.setattr(core.ur, "urlopen", raise_he)
-    st, body, ms = core._http("http://x")
+    st, body, ms = core._http("http://api.tushare.pro/x")
     assert st == 404
 
 
@@ -502,3 +502,226 @@ def test_alltick_ok_200(monkeypatch):
                         lambda *a, **k: (200, '{"data":{"kline":[]}}', 5))
     assert "data" in core.alltick("1.600519")
 
+
+
+# ---------- Phase 0 加固：SSRF 白名单 / 重试退避 / 输入校验 / 脱敏 ----------
+
+def test_http_retries_on_5xx_then_ok(monkeypatch):
+    """5xx 应重试；退避 sleep 被打桩，测试零耗时。"""
+    import urllib.error as ue
+    seq = iter([ue.HTTPError("http://api.tushare.pro", 503, "UE", {}, None),
+                ue.HTTPError("http://api.tushare.pro", 502, "UE", {}, None),
+                _FakeResp()])
+    calls = {"n": 0}
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        item = next(seq)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    st, body, ms = core._http("http://api.tushare.pro/x")
+    assert st == 200 and calls["n"] == 3
+
+
+def test_http_no_retry_on_404(monkeypatch):
+    """4xx 不重试（客户端错误，重试只会放大故障）。"""
+    import urllib.error as ue
+    calls = {"n": 0}
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise ue.HTTPError("http://api.tushare.pro", 404, "NF", {}, None)
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    st, _, _ = core._http("http://api.tushare.pro/x")
+    assert st == 404 and calls["n"] == 1
+
+
+def test_http_no_retry_on_429(monkeypatch):
+    """429 限频不重试。"""
+    import urllib.error as ue
+    calls = {"n": 0}
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise ue.HTTPError("http://api.tushare.pro", 429, "RL", {}, None)
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    st, _, _ = core._http("http://api.tushare.pro/x")
+    assert st == 429 and calls["n"] == 1
+
+
+def test_http_retries_on_transport_error_then_ok(monkeypatch):
+    """传输层错误（URLError 超时）应重试。"""
+    import urllib.error as ue
+    seq = iter([ue.URLError("timeout"), _FakeResp()])
+    calls = {"n": 0}
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        item = next(seq)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    st, _, _ = core._http("http://api.tushare.pro/x")
+    assert st == 200 and calls["n"] == 2
+
+
+def test_http_retry_exhausted_raises(monkeypatch):
+    """重试耗尽后异常上抛（adapter 的 except 转结构化 error）。"""
+    import urllib.error as ue
+    calls = {"n": 0}
+    def fake(req, timeout=None):
+        calls["n"] += 1
+        raise ue.URLError("timeout")
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    monkeypatch.setattr(core, "_sleep_backoff", lambda attempt: None)
+    try:
+        core._http("http://api.tushare.pro/x")
+        assert False, "should raise after retries exhausted"
+    except ue.URLError:
+        pass
+    assert calls["n"] == core._RETRY_MAX + 1
+
+
+def test_retryable_status_set():
+    """重试集合口径：5xx 在、4xx/429 不在。"""
+    assert 503 in core._RETRYABLE_STATUS and 502 in core._RETRYABLE_STATUS
+    assert 404 not in core._RETRYABLE_STATUS and 429 not in core._RETRYABLE_STATUS
+
+
+# ---------- SSRF 主机白名单 ----------
+
+def test_guard_url_blocks_non_whitelisted_host():
+    for bad in ("https://evil.example.com/x", "http://127.0.0.1:8080/admin",
+                "http://169.254.169.254/latest/meta-data",
+                "https://qt.gtimg.cn.evil.com/x", "https://notqt.gtimg.cn/x"):
+        try:
+            core._guard_url(bad)
+            assert False, f"should block {bad}"
+        except ValueError:
+            pass
+
+
+def test_guard_url_blocks_non_http_scheme():
+    for bad in ("file:///etc/passwd", "ftp://api.tushare.pro/x", "gopher://x/1"):
+        try:
+            core._guard_url(bad)
+            assert False, f"should block {bad}"
+        except ValueError:
+            pass
+
+
+def test_guard_url_allows_whitelisted():
+    core._guard_url("http://api.tushare.pro")
+    core._guard_url("https://quote.alltick.io/kline?token=x")
+    core._guard_url("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get")
+
+
+def test_http_blocks_non_whitelisted_host(monkeypatch):
+    """_http 层门禁：不发请求、不做 DNS 即拒。"""
+    called = {"n": 0}
+    def fake(req, timeout=None):
+        called["n"] += 1
+        return _FakeResp()
+    monkeypatch.setattr(core.ur, "urlopen", fake)
+    try:
+        core._http("https://evil.example.com/x")
+        assert False, "should raise ValueError"
+    except ValueError:
+        pass
+    assert called["n"] == 0
+
+
+def test_tencent_quote_symbol_injection_blocked(monkeypatch):
+    """symbol 注入（@ 改 host）在 _check_symbol/_guard_url 处被拒，返回结构化 error。"""
+    out = core.tencent_quote("600519@evil.com")
+    assert "error" in out
+
+
+# ---------- 输入校验 ----------
+
+def test_check_symbol_rejects_injection():
+    for bad in ("", "   ", "a@b", "x/y", "q?z", "h#t", "a b", "%2e%2e",
+                "x" * 33):
+        try:
+            core._check_symbol(bad)
+            assert False, f"should reject {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_check_symbol_accepts_valid():
+    assert core._check_symbol(" sh600519 ") == "sh600519"
+    assert core._check_symbol("usAAPL.OQ") == "usAAPL.OQ"
+    assert core._check_symbol("gb_apple") == "gb_apple"
+
+
+def test_check_date_and_choice():
+    for bad in ("2026/01/01", "x", "202601011", ""):
+        try:
+            core._check_date(bad, "start")
+            assert False, f"should reject {bad!r}"
+        except ValueError:
+            pass
+    assert core._check_date("20260101") == "20260101"
+    assert core._check_date("2026-01-01") == "2026-01-01"
+    assert core._check_choice("DAY", {"day"}, "period") == "day"
+
+
+def test_adapter_invalid_input_returns_error_not_raise():
+    """装饰器契约：非法输入 -> {"error":...}，绝不抛异常炸工具层。"""
+    assert "error" in core.coingecko("bad symbol!")
+    assert "error" in core.fred("GDP;drop table")
+    assert "error" in core.tencent_kline("600519", "bogus")
+    assert "error" in core.alltick("x" * 40)
+    assert "error" in core.akshare_stock_hist("600519", "sh", "20260101", "x", "qfq")
+    assert "error" in core.fx_rate("US", "CNY")
+
+
+def test_structured_errors_wraps_preserve_metadata():
+    """关键 adapter 必须带 _structured_errors（functools.wraps 保留 __wrapped__）。"""
+    for name in ("tushare", "alpha_vantage", "alltick", "tencent_kline",
+                 "akshare_stock_hist", "quant_call"):
+        fn = getattr(core, name)
+        assert getattr(fn, "__wrapped__", None) is not None, name
+        assert fn.__name__ == name
+
+
+# ---------- 密钥脱敏 ----------
+
+def test_redact_masks_sensitive_params():
+    out = core._redact("https://quote.alltick.io/kline?token=SECRET&q=1&apikey=K2"
+                       "&api_key=K3&access_token=T4")
+    for secret in ("SECRET", "K2", "K3", "T4"):
+        assert secret not in out
+    assert "token=***" in out and "apikey=***" in out
+    assert "api_key=***" in out and "access_token=***" in out
+
+
+def test_redact_no_op_on_plain_text():
+    assert core._redact("plain message") == "plain message"
+    assert core._redact("") == ""
+
+
+def test_alltick_error_body_redacted(monkeypatch):
+    """alltick 错误回显 body 不得泄露 token。"""
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {"token": "SUPERSECRET"})
+    monkeypatch.setattr(core, "_http",
+                        lambda *a, **k: (401, '{"code":401,"msg":"bad token=SUPERSECRET"}', 5))
+    out = core.alltick("1.600519")
+    assert "error" in out
+    assert "SUPERSECRET" not in str(out)
+
+
+def test_adapter_error_message_redacted(monkeypatch):
+    """URLError 消息含带 token 的完整 URL 时，error 出口必须脱敏。"""
+    import urllib.error as ue
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {"token": "SUPERSECRET"})
+    def boom(*a, **k):
+        raise ue.URLError("https://quote.alltick.io/kline?token=SUPERSECRET timeout")
+    monkeypatch.setattr(core, "_http", boom)
+    out = core.alltick("1.600519")
+    assert "SUPERSECRET" not in str(out)
+    assert "token=***" in out["error"]
