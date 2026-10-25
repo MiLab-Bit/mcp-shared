@@ -1,4 +1,6 @@
 # 只跟踪根级共享模块；mcp-servers/、startup-intel/、scratch 等各自管理
+# 注意：白名单模式——新增根级 .py 模块必须在此登记，否则被静默忽略
+# （曾漏登记 metrics.py/logging_utils.py 导致 CI ruff 将其解析为第三方包名报 I001）
 /*
 !/.gitignore
 !/README.md
@@ -11,6 +13,8 @@
 !/mcp_usage.py
 !/mcp_asgi.py
 !/mcp_auth.py
+!/metrics.py
+!/logging_utils.py
 !/tests/
 !/check_venv_invariants.sh
 !/.github/
