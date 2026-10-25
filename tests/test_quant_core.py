@@ -5,6 +5,7 @@
 三服务共用；其黄金测试以本文件为权威（macro/alt 仓库不再重复）。
 """
 import json
+import time
 
 import metrics
 import quant_core as core
@@ -1175,6 +1176,37 @@ def test_prov_tokens_pool_priority(monkeypatch):
         {"token": "tk_pool_b", "weight": 1, "last_used_at": "2026-10-25T00:00:00+00:00"}])
     monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
     assert core._prov_tokens("tushare") == ["tk_pool_a", "tk_pool_b"]
+
+
+def test_prov_tokens_pool_appends_single(monkeypatch):
+    """入池为追加语义：pool + fields.token 并集去重（互斥"=>配额不增反降"陷阱）。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [
+        {"token": "tk_pool_a", "weight": 1, "last_used_at": None}])
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    monkeypatch.setattr(core, "_prov_fields",
+                        lambda p: {"token": "tk_single"} if p == "tushare" else {})
+    assert core._prov_tokens("tushare") == ["tk_pool_a", "tk_single"]
+
+
+def test_prov_tokens_pool_dedups_same_token(monkeypatch):
+    """同一 token 同时存在于 pool 与 fields → 去重后只算一把。"""
+    monkeypatch.setattr(core.sc, "select", lambda *a, **k: [
+        {"token": "tk_same", "weight": 1, "last_used_at": None}])
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE", {})
+    monkeypatch.setattr(core, "_prov_fields",
+                        lambda p: {"token": "tk_same"} if p == "tushare" else {})
+    assert core._prov_tokens("tushare") == ["tk_same"]
+
+
+def test_prov_tokens_fields_exception_keeps_pool(monkeypatch):
+    """fields 读取异常时不拖垮 pool（并集的一侧失败仍返回另一侧）。"""
+    monkeypatch.setattr(core, "_TOKEN_POOL_CACHE",
+                        {"tushare": (time.time(), ["tk_pool_a"])})
+    monkeypatch.setattr(core, "_TOKEN_POOL_TTL", 1e9)
+    def boom(p):
+        raise RuntimeError("supabase down")
+    monkeypatch.setattr(core, "_prov_fields", boom)
+    assert core._prov_tokens("tushare") == ["tk_pool_a"]
 
 
 def test_prov_tokens_fallback_single(monkeypatch):

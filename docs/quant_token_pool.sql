@@ -1,9 +1,11 @@
 -- Phase 5：quant 多 token 轮换池（quant_token_pool）
 -- 在 Supabase SQL Editor 执行（openclaw 项目）。service_role 全权（与 quant_providers 一致）。
 -- 说明：
---   * 代码侧（quant_core._prov_tokens/_pick_token）已实现：本表有 active 记录即轮换，
---     无记录/表不存在/查询异常一律静默退化单 token（quant_providers.fields.token），
---     向后兼容——本 SQL 不执行也不影响现有链路。
+--   * 代码侧（quant_core._prov_tokens/_pick_token）已实现：**入池为追加语义**——
+--     可用 token = active 池 ∪ quant_providers.fields.token（去重，池内优先）。
+--     因此只补充新 token 不会让原 fields.token 失效（不会出现"配额不增反降"）；
+--     迁移完成后建议把 fields.token 清空，让 pool 成为该 provider 的唯一真源。
+--     本 SQL 不执行也不影响现有链路（空池 → 退化单 token）。
 --   * 轮换口径：active 中 last_used_at 最旧（NULL 优先）→ weight 降序；
 --     进程内 round-robin 取用，取用后回写 last_used_at（多实例协同）。
 --   * 限额提升场景：同一 provider 多把 token（如 alpha_vantage 免费 25次/日 多账号），

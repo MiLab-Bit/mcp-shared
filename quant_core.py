@@ -89,14 +89,21 @@ def _token_pool_cached(provider):
 
 def _prov_tokens(provider):
     """provider 的全部可用 token（Phase 5）。
-    pool 有 active 记录 → 多 token（last_used_at 最旧/weight 降序）；
-    否则退化 quant_providers.fields.token 单 token（向后兼容）。
-    返回 [token, ...]（可能为空）。"""
+    pool 语义为**追加**：active 池 + 既有 quant_providers.fields.token，
+    去重后一并返回（pool 在前，轮换自 pool 起始）。
+    这样「只入池一把新 token」不会让原有单 token 失效——
+    迁移完成后建议清空 fields.token，让 pool 成为唯一真源。
+    空池 + 无单 token → 空列表。"""
     pool = _token_pool_cached(provider)
-    if pool:
-        return pool
-    tk = _prov_fields(provider).get("token")
-    return [tk] if tk else []
+    single = ""
+    try:
+        single = _prov_fields(provider).get("token") or ""
+    except Exception:
+        pass  # fields 读取异常不阻断 pool
+    out = list(pool)
+    if single and single not in out:
+        out.append(single)
+    return out
 
 
 def _pick_token(provider):
