@@ -84,6 +84,7 @@ _HOST_PROVIDER = {
     "web.ifzq.gtimg.cn": "tencent",            # 腾讯日/周/月 K 线
     "hq.sinajs.cn": "sina",                    # 新浪行情
     "api.frankfurter.dev": "frankfurter",      # Frankfurter 外汇历史（免费无 key）
+    "datacenter-web.eastmoney.com": "eastmoney",  # 东方财富数据中心（龙虎榜等报表）
 }
 _HTTP_ALLOWED_HOSTS = frozenset(_HOST_PROVIDER)
 
@@ -268,7 +269,6 @@ def _check_pattern(value, pattern, what):
 # ---------------- TuShare ---------------
 @_structured_errors
 def tushare(api_name: str, params: dict, fields: str = "") -> dict:
-    api_name = _check_series_id(api_name, "api_name")
     api_name = _check_series_id(api_name, "api_name")
     tk = _prov_fields("tushare").get("token")
     if not tk:
@@ -489,6 +489,52 @@ def coingecko_markets(vs: str = "usd", ids: str = "bitcoin,ethereum",
                 "count": len(out), "markets": out, "ms": ms}
     except Exception as e:
         return {"error": _err(e, f"（经代理 {PROXY}）")}
+
+
+# ---------------- 东方财富数据中心（免费无 key，补 TuShare 积分缺口） ----------------
+@_structured_errors
+def eastmoney_top_list(trade_date: str = "", limit: int = 20) -> dict:
+    """龙虎榜每日明细（东财 datacenter RPT_DAILYBILLBOARD_DETAILS，免费无 key；
+    补 TuShare top_list 的积分缺口——当前 token 无该接口权限）。
+    trade_date: YYYY-MM-DD / YYYYMMDD，空=最新交易日。
+    返回买卖额/净额/上榜原因等，按交易日倒序。"""
+    limit = _clamp_limit(limit, 20)
+    q = {"reportName": "RPT_DAILYBILLBOARD_DETAILS", "columns": "ALL",
+         "pageSize": limit, "sortColumns": "TRADE_DATE,TRADE_ID",
+         "sortTypes": "-1,-1"}
+    if trade_date:
+        d = _check_date(trade_date, "trade_date").replace("-", "")
+        q["filter"] = f"(TRADE_DATE='{d[:4]}-{d[4:6]}-{d[6:8]}')"
+    url = ("https://datacenter-web.eastmoney.com/api/data/v1/get?"
+           + up.urlencode(q))
+    try:
+        st, b, ms = _http(url, headers=HERMES_UA)
+        d = json.loads(b)
+        rows = ((d.get("result") or {}).get("data")) or []
+        out = [{"symbol": r.get("SECURITY_CODE"),
+                "secucode": r.get("SECUCODE"),
+                "name": r.get("SECURITY_NAME_ABBR"),
+                "explanation": r.get("EXPLANATION"),
+                "close": r.get("CLOSE_PRICE"),
+                "pct_chg": r.get("CHANGE_RATE"),
+                "buy_amt": r.get("BILLBOARD_BUY_AMT"),
+                "sell_amt": r.get("BILLBOARD_SELL_AMT"),
+                "net_amt": r.get("BILLBOARD_NET_AMT")} for r in rows]
+        if not out:
+            return {"error": f"eastmoney 龙虎榜无数据 date={trade_date or 'latest'}",
+                    "http": st}
+        return {"provider": "eastmoney", "source": "top_list", "http": st,
+                "trade_date": rows[0].get("TRADE_DATE"),
+                "count": len(out), "rows": out, "ms": ms}
+    except Exception as e:
+        return {"error": _err(e)}
+
+
+def eastmoney_top_list_cached(trade_date="", limit=20, ttl=None) -> dict:
+    """龙虎榜缓存 10min（当日盘后更新，日内稳定）。"""
+    ttl = _ttl(ttl, "eastmoney")
+    key = f"em:top_list:{trade_date}:{limit}"
+    return cache_get(key, ttl, eastmoney_top_list, trade_date, limit)
 
 
 # ---------------- Alltick ---------------
@@ -916,13 +962,14 @@ _TTL_DEFAULTS = {
     "alpha_vantage": 600,  # 每日 25 次免费 → 10min
     "fred": 1800,          # 宏观序列 → 30min
     "akshare": 3600,       # 日频数据 → 1h
+    "eastmoney": 600,      # 龙虎榜等报表（当日盘后更新）→ 10min
 }
 
 
 # 缓存键前缀 → provider（metrics per-provider 缓存口径）。
 # fx:* 是 alpha_vantage 的汇率限频保护缓存，归 alpha_vantage。
 _CACHE_KEY_PROV = {"tushare": "tushare", "av": "alpha_vantage", "fx": "alpha_vantage",
-                   "fred": "fred", "akshare": "akshare"}
+                   "fred": "fred", "akshare": "akshare", "em": "eastmoney"}
 
 
 def _cache_observe(key, hit):
@@ -1252,12 +1299,20 @@ _PROVIDER_CATALOG = [
     {"provider": "frankfurter", "endpoints": "rates(历史) / rate(最新)",
      "desc": "外汇历史汇率（228 币种，回溯 1948，日频）",
      "auth": "无（免费无 key）", "reachable": "yes",
-     "tools": "（经 quant_call）", "quant_call": True},
-    {"provider": "tushare", "endpoints": "<api_name>（daily / trade_cal / index_daily / stock_basic 等）",
-     "desc": "TuShare 全量 A股/指数/基本面数据（积分制，超档接口需积分）",
+     "tools": "get_fx_history（macro 仓）", "quant_call": True},
+    {"provider": "tushare",
+     "endpoints": "<api_name>（daily / trade_cal / index_daily / stock_basic / dividend / cb_basic 等）",
+     "desc": "TuShare 全量 A股/指数/基本面数据（积分制）。当前 token 已开通 dividend/cb_basic；"
+             "深度接口（fina_indicator / index_weight / moneyflow_hsgt / top_list / "
+             "index_classify / ths_index / moneyflow）需更高积分，未开通时返回权限 error",
      "auth": "token（Supabase quant_providers，积分制）", "reachable": "yes",
-     "tools": "get_stock_daily / fetch_tushare / get_trade_calendar / get_index_daily",
+     "tools": "get_stock_daily / fetch_tushare / get_trade_calendar / get_index_daily / "
+              "get_dividend / get_cb_basic",
      "quant_call": True},
+    {"provider": "eastmoney", "endpoints": "top_list(龙虎榜明细)",
+     "desc": "东方财富数据中心报表（免费无 key；补 TuShare top_list 的积分缺口）",
+     "auth": "无（免费）", "reachable": "yes",
+     "tools": "get_top_list", "quant_call": False},
     {"provider": "alpha_vantage",
      "endpoints": "GLOBAL_QUOTE / TIME_SERIES_DAILY / CURRENCY_EXCHANGE_RATE / 基本面四表 等",
      "desc": "美股报价/指数/外汇/基本面（每日 25 次免费）",
@@ -1276,7 +1331,8 @@ _PROVIDER_CATALOG = [
     {"provider": "coingecko", "endpoints": "price / ohlc / markets",
      "desc": "加密行情/OHLC/市场列表（免费档限频约 10-30 次/分）",
      "auth": "无（免费档）", "reachable": "proxy",
-     "tools": "（经 quant_call）", "quant_call": True},
+     "tools": "get_crypto_price / get_coin_ohlc / get_coin_markets（alt 仓）",
+     "quant_call": True},
     {"provider": "polymarket", "endpoints": "events",
      "desc": "预测市场事件（Polymarket Gamma）",
      "auth": "无", "reachable": "proxy",

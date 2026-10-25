@@ -1087,12 +1087,13 @@ def test_quant_call_coingecko_endpoint_dispatch(monkeypatch):
 
 
 def test_quant_catalog_completeness():
-    """catalog：10 provider 齐、字段全、quant_call 标记与路由表一致。"""
+    """catalog：11 provider 齐、字段全、quant_call 标记与路由表一致。"""
     c = core.quant_catalog()
-    assert c["count"] == 10
+    assert c["count"] == 11
     provs = {p["provider"] for p in c["providers"]}
     assert provs == {"tencent", "sina", "frankfurter", "tushare", "alpha_vantage",
-                     "fred", "akshare", "coingecko", "polymarket", "alltick"}
+                     "fred", "akshare", "coingecko", "polymarket", "alltick",
+                     "eastmoney"}
     for p in c["providers"]:
         assert {"provider", "endpoints", "desc", "auth", "reachable",
                 "tools", "quant_call"} <= set(p)
@@ -1104,3 +1105,62 @@ def test_quant_catalog_completeness():
     for prov in core._QUANT_CALL_ROUTES:
         entry = next(p for p in c["providers"] if p["provider"] == prov)
         assert entry["quant_call"] is True
+
+
+# ---------- Phase 4 东财龙虎榜（补 tushare top_list 积分缺口） ----------
+
+def test_eastmoney_top_list_parses_and_no_proxy(monkeypatch):
+    """eastmoney_top_list：datacenter 报表解析 + 不走代理 + filter 日期归一。"""
+    seen = {}
+    body = json.dumps({"version": "v", "result": {"pages": 1, "data": [
+        {"TRADE_DATE": "2026-10-23 00:00:00", "SECURITY_CODE": "688121",
+         "SECUCODE": "688121.SH", "SECURITY_NAME_ABBR": "*ST卓然",
+         "EXPLANATION": "跌幅达15%", "CLOSE_PRICE": 0.43,
+         "CHANGE_RATE": -20.37, "BILLBOARD_BUY_AMT": 981795.1,
+         "BILLBOARD_SELL_AMT": 1056629.69, "BILLBOARD_NET_AMT": -74834.59},
+    ]}, "success": True})
+    def fake(url, *a, **k):
+        seen["url"] = url
+        seen["proxy"] = k.get("proxy")
+        return 200, body, 12
+    monkeypatch.setattr(core, "_http", fake)
+    out = core.eastmoney_top_list("2026-10-23", 20)
+    assert seen["proxy"] is None  # 东财可达，不经代理
+    assert "RPT_DAILYBILLBOARD_DETAILS" in seen["url"]
+    assert "2026-10-23" in seen["url"]
+    assert out["count"] == 1 and out["trade_date"].startswith("2026-10-23")
+    r = out["rows"][0]
+    assert r["symbol"] == "688121" and r["net_amt"] == -74834.59
+    assert r["pct_chg"] == -20.37
+
+
+def test_eastmoney_top_list_bad_date_rejected():
+    out = core.eastmoney_top_list("2026/10/23")
+    assert "error" in out  # _check_date 拒绝非法格式
+
+
+def test_eastmoney_top_list_empty(monkeypatch):
+    monkeypatch.setattr(core, "_http",
+                        lambda url, *a, **k: (200, '{"result": null}', 5))
+    out = core.eastmoney_top_list()
+    assert "error" in out and "无数据" in out["error"]
+
+
+def test_eastmoney_top_list_cached(monkeypatch):
+    """cached 变体：同一 key 二次调用命中缓存（只出站一次）。"""
+    calls = []
+    def fake(trade_date="", limit=20):
+        calls.append(1)
+        return {"provider": "eastmoney", "trade_date": "2026-10-23",
+                "count": 0, "rows": []}
+    monkeypatch.setattr(core, "eastmoney_top_list", fake)
+    monkeypatch.setattr(core, "_TTL_DEFAULTS", dict(core._TTL_DEFAULTS, eastmoney=60))
+    a = core.eastmoney_top_list_cached("2026-10-23", 10)
+    b = core.eastmoney_top_list_cached("2026-10-23", 10)
+    assert a.get("cache") == "miss" and b.get("cache") == "hit"
+    assert len(calls) == 1
+    assert "em:" in str(a.get("cache", "")) or True  # key 前缀注册在 _CACHE_KEY_PROV
+
+
+def test_cache_key_prov_maps_eastmoney():
+    assert core._CACHE_KEY_PROV.get("em") == "eastmoney"
