@@ -147,6 +147,24 @@ def test_fx_rate_token_missing(monkeypatch):
     assert core.fx_rate()["error"] == "alpha_vantage token missing"
 
 
+def test_fx_rate_provider_error_normalized(monkeypatch):
+    """HTTP 200 + provider 'Error Message' 必须归一化为 error（线上有网络时才暴露）。"""
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {"token": "tk"})
+    monkeypatch.setattr(core, "_http",
+                        lambda *a, **k: (200, json.dumps({"Error Message": "Invalid API call."}), 7))
+    out = core.fx_rate("US", "CNY")
+    assert "error" in out and "Invalid API call" in out["error"]
+
+
+def test_fx_rate_rate_limit_note_normalized(monkeypatch):
+    """限频提示 'Note' 也要归一化，避免被当成成功响应。"""
+    monkeypatch.setattr(core, "_prov_fields", lambda p: {"token": "tk"})
+    monkeypatch.setattr(core, "_http",
+                        lambda *a, **k: (200, json.dumps({"Note": "call frequency"}), 7))
+    out = core.fx_rate("USD", "CNY")
+    assert "error" in out and "限频" in out["error"]
+
+
 def test_tushare_api_error(monkeypatch):
     monkeypatch.setattr(core, "_prov_fields", lambda p: {"token": "tk"})
     monkeypatch.setattr(core, "_http",
@@ -1088,13 +1106,13 @@ def test_quant_call_coingecko_endpoint_dispatch(monkeypatch):
 
 
 def test_quant_catalog_completeness():
-    """catalog：11 provider 齐、字段全、quant_call 标记与路由表一致。"""
+    """catalog：13 provider 齐、字段全、quant_call 标记与路由表一致。"""
     c = core.quant_catalog()
-    assert c["count"] == 11
+    assert c["count"] == 13
     provs = {p["provider"] for p in c["providers"]}
     assert provs == {"tencent", "sina", "frankfurter", "tushare", "alpha_vantage",
                      "fred", "akshare", "coingecko", "polymarket", "alltick",
-                     "eastmoney"}
+                     "eastmoney", "binance", "treasury"}
     for p in c["providers"]:
         assert {"provider", "endpoints", "desc", "auth", "reachable",
                 "tools", "quant_call"} <= set(p)
@@ -1360,3 +1378,239 @@ class _BadModule:
         return self
     def from_url(self, *a, **k):
         return self._c()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 期货/债券 adapters（补齐第四类资产与债券类；Binance 免 key / 财政部免 key）
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_check_futures_symbol_rules():
+    assert core._check_futures_symbol(" btcusdt ") == "BTCUSDT"
+    assert core._check_futures_symbol("ETHUSDT") == "ETHUSDT"
+    for bad in ("", "BTC", "BTC-USDT", "btc usdt", "BTCUSDT!!", "X" * 21):
+        try:
+            core._check_futures_symbol(bad)
+            assert False, f"should reject {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_check_futures_interval_rules():
+    assert core._check_choice("1d", core._FUTURES_INTERVALS, "interval") == "1d"
+    out = core.binance_futures_klines("BTCUSDT", "bogus")
+    assert "error" in out  # 非法 interval 拒绝
+
+
+def test_futures_symbol_injection_blocked():
+    """symbol 注入（@ 改 host）经 _check_futures_symbol 拒绝 → 结构化 error。"""
+    out = core.binance_futures_ticker("BTCUSDT@evil.com")
+    assert "error" in out
+
+
+def test_binance_futures_ticker_parses(monkeypatch):
+    body = json.dumps({"lastPrice": "68000.0", "priceChangePercent": "2.5",
+                       "highPrice": "69000.0", "lowPrice": "67000.0",
+                       "volume": "12345.5", "quoteVolume": "8.4e10"})
+    seen = {}
+    def fake(url, *a, **k):
+        seen["url"] = url
+        seen["proxy"] = k.get("proxy")
+        return 200, body, 8
+    monkeypatch.setattr(core, "_http", fake)
+    out = core.binance_futures_ticker("BTCUSDT")
+    assert out["price"] == 68000.0 and out["change_24h_pct"] == 2.5
+    assert out["quote_volume_24h"] == 8.4e10
+    assert "fapi.binance.com/fapi/v1/ticker/24hr" in seen["url"]
+    assert seen["proxy"] == core.PROXY  # 大陆可达需代理
+
+
+def test_binance_futures_ticker_business_error(monkeypatch):
+    """Binance 业务错误包 {"code":-1121,...} → 结构化 error。"""
+    monkeypatch.setattr(core, "_http",
+                        lambda *a, **k: (200, '{"code":-1121,"msg":"Invalid symbol"}', 5))
+    out = core.binance_futures_ticker("BOGUS")
+    assert "error" in out and "Invalid symbol" in out["error"]
+
+
+def test_binance_futures_open_interest_parses(monkeypatch):
+    body = json.dumps({"symbol": "BTCUSDT", "openInterest": "18234.512",
+                       "time": 1761667200000})
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, body, 6))
+    out = core.binance_futures_open_interest("BTCUSDT")
+    assert out["open_interest"] == 18234.512
+    assert "fapi/v1/openInterest" in out.get("provider", "") or out["provider"] == "binance"
+
+
+def test_binance_futures_premium_index_parses(monkeypatch):
+    body = json.dumps({"symbol": "BTCUSDT", "markPrice": "68010.0",
+                       "indexPrice": "68000.0", "lastFundingRate": "0.0001",
+                       "interestRate": "0.0001", "nextFundingTime": 1761688800000})
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, body, 6))
+    out = core.binance_futures_premium_index("BTCUSDT")
+    assert out["mark_price"] == 68010.0
+    assert out["last_funding_rate"] == 0.0001
+
+
+def test_binance_futures_klines_ta_compatible(monkeypatch):
+    """K 线须产出 ta.compute 兼容的 klines（date/open/high/low/close/volume）。"""
+    raw = [
+        [1761580800000, "67000.0", "67500.0", "66900.0", "67200.0", "1200.5", 1761667200000],
+        [1761667200000, "67200.0", "68100.0", "67100.0", "68000.0", "1500.0", 1761753600000],
+    ]
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, json.dumps(raw), 12))
+    out = core.binance_futures_klines("BTCUSDT", "1d", 120)
+    assert out["count"] == 2
+    k = out["klines"][0]
+    assert set(k) == {"date", "open", "high", "low", "close", "volume"}
+    assert k["close"] == 67200.0 and k["volume"] == 1200.5
+    assert isinstance(k["date"], int)  # close_time//1000 秒级时间戳
+
+
+def test_binance_futures_klines_nonlist_returns_error(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, '{"code":-1121,"msg":"x"}', 5))
+    out = core.binance_futures_klines("BOGUS")
+    assert "error" in out
+
+
+def test_eastmoney_futures_parses(monkeypatch):
+    body = json.dumps({"data": {"name": "沪金主力", "code": "AU0",
+                                "price": 612.5, "pctChg": 1.23, "open": 610.0,
+                                "high": 615.0, "low": 609.0, "preClose": 605.0}})
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, body, 7))
+    out = core.eastmoney_futures("115.AU0")
+    assert out["name"] == "沪金主力" and out["price"] == 612.5
+    assert out["change_pct"] == 1.23
+
+
+def test_eastmoney_futures_bad_secid_rejected():
+    out = core.eastmoney_futures("not-a-secid!")
+    assert "error" in out  # _check_pattern 拒绝
+
+
+def test_eastmoney_futures_empty_returns_error(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, '{"data":null}', 5))
+    out = core.eastmoney_futures("115.AU0")
+    assert "error" in out and "no data" in out["error"]
+
+
+# ---------- 财政部收益率曲线（纯解析 + adapter） ----------
+
+def _fake_treasury_csv():
+    header = ("Date,3 Mo,6 Mo,1 Yr,2 Yr,3 Yr,5 Yr,7 Yr,10 Yr,20 Yr,30 Yr")
+    row1 = "11/03/2025,4.50,4.55,4.30,4.10,4.05,4.00,4.10,4.20,4.50,4.70"
+    row2 = "11/04/2025,4.51,4.56,4.31,4.12,4.07,4.02,4.12,4.25,4.55,4.72"
+    return "\n".join([header, row1, row2])
+
+
+def test_treasury_date_and_curve_parse():
+    assert core._parse_treasury_date("11/04/2025") == "2025-11-04"
+    assert core._parse_treasury_date("bad") == "bad"
+    row = {h: v for h, v in zip(
+        ["Date", "3 Mo", "6 Mo", "1 Yr", "2 Yr", "3 Yr", "5 Yr", "7 Yr", "10 Yr", "20 Yr", "30 Yr"],
+        ["11/04/2025", "4.50", "4.55", "4.30", "4.10", "4.05", "4.00", "4.10", "4.20", "4.50", "4.70"])}
+    curve = core._row_to_curve(row)
+    by_label = {c["tenor"]: c["yield"] for c in curve}
+    assert by_label["10Y"] == 4.20 and by_label["2Y"] == 4.10
+    assert core._row_to_curve({"Date": "x"}) == []  # 无期限 → 空曲线
+
+
+def test_treasury_curve_parses(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, _fake_treasury_csv(), 20))
+    out = core.treasury_curve(2025)
+    assert out["date"] == "2025-11-04"  # 末行
+    by_label = {c["tenor"]: c["yield"] for c in out["curve"]}
+    assert by_label["10Y"] == 4.25 and by_label["2Y"] == 4.12
+    assert out["spread_2s10s"] == round(4.25 - 4.12, 4)
+    assert out["provider"] == "treasury"
+
+
+def test_treasury_curve_no_rows(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, "Date,3 Mo\n", 5))
+    out = core.treasury_curve(2025)
+    assert "error" in out and "no rows" in out["error"]
+
+
+def test_treasury_curve_whitelisted_and_guard():
+    assert "home.treasury.gov" in core._HTTP_ALLOWED_HOSTS
+    assert core._HOST_PROVIDER["home.treasury.gov"] == "treasury"
+    assert "fapi.binance.com" in core._HTTP_ALLOWED_HOSTS
+    assert core._HOST_PROVIDER["fapi.binance.com"] == "binance"
+
+
+def test_treasury_defaults_to_proxy(monkeypatch):
+    """home.treasury.gov 是海外站点：国内 ECS 直连会 read timeout，必须默认走 PROXY。"""
+    seen = {}
+
+    def spy(url, **kw):
+        seen.update(kw)
+        return (200, _fake_treasury_csv(), 20)
+
+    monkeypatch.setattr(core, "_http", spy)
+    core.treasury_curve(2025)
+    assert seen.get("proxy") == core.PROXY
+    seen.clear()
+    core.treasury_yields("DGS10")
+    assert seen.get("proxy") == core.PROXY
+
+
+def test_treasury_proxy_none_forces_direct(monkeypatch):
+    """显式 proxy='none' 时强制直连（境外部署环境可用）。"""
+    seen = {}
+
+    def spy(url, **kw):
+        seen.update(kw)
+        return (200, _fake_treasury_csv(), 20)
+
+    monkeypatch.setattr(core, "_http", spy)
+    core.treasury_curve(2025, proxy="none")
+    assert seen.get("proxy") is None
+
+
+def test_treasury_yields_fred_shaped(monkeypatch):
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, _fake_treasury_csv(), 20))
+    out = core.treasury_yields("DGS2,DGS10,DGS30,T10Y2Y,DGS10_HIST")
+    assert out["provider"] == "treasury"
+    assert out["latest"]["DGS10"] == 4.25
+    assert out["latest"]["T10Y2Y"] == round(4.25 - 4.12, 4)
+    assert "DGS10" in out["series"] and len(out["series"]["DGS10"]["values"]) == 2
+
+
+def test_treasury_yields_missing_tenor_safe(monkeypatch):
+    """曲线缺某期限时 latest 对应项为 None，不抛。"""
+    csv = ("Date,3 Mo,10 Yr\n11/04/2025,4.50,4.20\n")
+    monkeypatch.setattr(core, "_http", lambda *a, **k: (200, csv, 5))
+    out = core.treasury_yields("DGS2,DGS10")
+    assert out["latest"]["DGS10"] == 4.20
+    assert out["latest"]["DGS2"] is None  # 无 2Y 期限
+
+
+# ---------- 缓存封装 ----------
+
+def test_binance_futures_klines_cached_hit(monkeypatch):
+    core.cache_clear()
+    calls = {"n": 0}
+    def fake(symbol, interval="1d", limit=120, proxy=""):
+        calls["n"] += 1
+        return {"provider": "binance", "klines": []}
+    monkeypatch.setattr(core, "binance_futures_klines", fake)
+    core.binance_futures_klines_cached("BTCUSDT", "1d", 120)
+    core.binance_futures_klines_cached("BTCUSDT", "1d", 120)
+    assert calls["n"] == 1
+
+
+def test_treasury_curve_cached_hit(monkeypatch):
+    core.cache_clear()
+    calls = {"n": 0}
+    def fake(year=0, proxy=""):
+        calls["n"] += 1
+        return {"provider": "treasury", "curve": []}
+    monkeypatch.setattr(core, "treasury_curve", fake)
+    core.treasury_curve_cached(2025)
+    core.treasury_curve_cached(2025)
+    assert calls["n"] == 1
+
+
+def test_cache_key_prov_maps_new_providers():
+    assert core._CACHE_KEY_PROV.get("binance") == "binance"
+    assert core._CACHE_KEY_PROV.get("treasury") == "treasury"
+

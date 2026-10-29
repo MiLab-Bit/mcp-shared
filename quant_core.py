@@ -4,6 +4,7 @@ quant_core.py — Hermes 量化数据商领域逻辑（共享，供 hermes-quant
 能力：
   - 从 Supabase quant_providers 读凭证
   - 各 provider adapter：tushare/fred/alpha_vantage/akshare/coingecko/polymarket/alltick
+    /binance(期货 USDⓈ-M 合约)/treasury(美债收益率曲线)/eastmoney(商品期货兜底)
   - 结果归一化 → 写 quotes 表 / 直接返回
 连通性备注（河源 ECS 实测 2026-10-05）：
   ✅ tushare / alpha_vantage / fred  顺畅
@@ -156,6 +157,9 @@ _HOST_PROVIDER = {
     "hq.sinajs.cn": "sina",                    # 新浪行情
     "api.frankfurter.dev": "frankfurter",      # Frankfurter 外汇历史（免费无 key）
     "datacenter-web.eastmoney.com": "eastmoney",  # 东方财富数据中心（龙虎榜等报表）
+    "push2.eastmoney.com": "eastmoney",          # 东方财富个股/期货行情（商品期货兜底）
+    "fapi.binance.com": "binance",               # Binance USDⓈ-M 合约（免费无 key）
+    "home.treasury.gov": "treasury",             # 美国财政部每日收益率曲线（免费无 key）
 }
 _HTTP_ALLOWED_HOSTS = frozenset(_HOST_PROVIDER)
 
@@ -408,7 +412,14 @@ def fx_rate(from_c: str = "USD", to_c: str = "CNY") -> dict:
                       "from_currency": from_c, "to_currency": to_c, "apikey": token})
     try:
         st, b, ms = _http("https://www.alphavantage.co/query?" + q)
-        return {"provider": "alpha_vantage", "http": st, "data": json.loads(b), "ms": ms}
+        d = json.loads(b)
+        # 与 alpha_vantage/alpha_vantage_call 一致：provider 级错误必须归一化为 error，
+        # 否则 HTTP 200 + {"Error Message":...} 会被下游当成成功响应（线上有网络时才暴露）。
+        if "Error Message" in d:
+            return {"error": d["Error Message"], "http": st}
+        if "Note" in d:  # 限频提示
+            return {"error": f"alpha_vantage 限频: {d['Note']}", "http": st}
+        return {"provider": "alpha_vantage", "http": st, "data": d, "ms": ms}
     except Exception as e:
         return {"error": _err(e)}
 
@@ -508,6 +519,308 @@ def frankfurter(from_c: str = "USD", to_c: str = "CNY",
                 "start": out[0]["date"], "end": out[-1]["date"], "ms": ms}
     except Exception as e:
         return {"error": _err(e)}
+
+
+# ---------------- Futures: Binance USDⓈ-M（免费无 key，走 mihomo 代理） ----------------
+# 补齐旧 quant 舰队缺失的第四类资产（期货）。Binance fapi 在大陆被墙，
+# 故默认经 PROXY（mihomo :7890）；ticker/openInterest/klines/premiumIndex
+# 全部免 key。东财 push2 作为商品/中国合约的兜底源（直连）。
+
+_BINANCE_TICKER = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+_BINANCE_OI = "https://fapi.binance.com/fapi/v1/openInterest"
+_BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+_BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
+_EM_FUTURES = "https://push2.eastmoney.com/api/qt/stock/get"
+
+_FUTURES_INTERVALS = frozenset({"1m", "3m", "5m", "15m", "30m", "1h", "2h",
+                                "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"})
+
+
+def _check_futures_symbol(symbol):
+    s = str(symbol or "").strip().upper()
+    if not re.match(r"^[A-Z0-9]{4,20}$", s):
+        raise ValueError(f"invalid futures symbol: {symbol!r}（如 BTCUSDT）")
+    return s
+
+
+@_structured_errors
+def binance_futures_ticker(symbol: str = "BTCUSDT",
+                           proxy: str = "") -> dict:
+    """Binance 合约 24h 行情（fapi/v1/ticker/24hr，免 key）。
+    返回 lastPrice/priceChangePercent/high/low/volume/quoteVolume。
+    默认走 PROXY（大陆可达）；传 proxy='' 可强制直连。"""
+    sym = _check_futures_symbol(symbol)
+    px = proxy if proxy else PROXY
+    url = f"{_BINANCE_TICKER}?symbol={sym}"
+    try:
+        st, b, ms = _http(url, proxy=px, headers=HERMES_UA)
+        d = json.loads(b)
+        if isinstance(d, dict) and d.get("code"):  # Binance 错误包 {"code":-1121,...}
+            return {"error": f"binance: {d.get('msg', d)}", "http": st}
+        return {"provider": "binance", "symbol": sym, "http": st, "ms": ms,
+                "price": _to_num(d.get("lastPrice")),
+                "change_24h_pct": _to_num(d.get("priceChangePercent")),
+                "high_24h": _to_num(d.get("highPrice")),
+                "low_24h": _to_num(d.get("lowPrice")),
+                "volume_24h": _to_num(d.get("volume")),
+                "quote_volume_24h": _to_num(d.get("quoteVolume"))}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {px}）")}
+
+
+@_structured_errors
+def binance_futures_open_interest(symbol: str = "BTCUSDT",
+                                  proxy: str = "") -> dict:
+    """Binance 未平仓合约量（fapi/v1/openInterest，免 key）。
+    返回当前 openInterest 与 symbol；持仓异动常领先价格。"""
+    sym = _check_futures_symbol(symbol)
+    px = proxy if proxy else PROXY
+    url = f"{_BINANCE_OI}?symbol={sym}"
+    try:
+        st, b, ms = _http(url, proxy=px, headers=HERMES_UA)
+        d = json.loads(b)
+        if isinstance(d, dict) and d.get("code"):
+            return {"error": f"binance: {d.get('msg', d)}", "http": st}
+        return {"provider": "binance", "symbol": sym, "http": st, "ms": ms,
+                "open_interest": _to_num((d or {}).get("openInterest")),
+                "time": (d or {}).get("time")}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {px}）")}
+
+
+@_structured_errors
+def binance_futures_premium_index(symbol: str = "BTCUSDT",
+                                  proxy: str = "") -> dict:
+    """Binance 资金费率标的溢价指数（fapi/v1/premiumIndex，免 key）。
+    返回 markPrice / indexPrice / lastFundingRate（判断多空拥挤与费率成本）。"""
+    sym = _check_futures_symbol(symbol)
+    px = proxy if proxy else PROXY
+    url = f"{_BINANCE_PREMIUM}?symbol={sym}"
+    try:
+        st, b, ms = _http(url, proxy=px, headers=HERMES_UA)
+        d = json.loads(b)
+        if isinstance(d, dict) and d.get("code"):
+            return {"error": f"binance: {d.get('msg', d)}", "http": st}
+        return {"provider": "binance", "symbol": sym, "http": st, "ms": ms,
+                "mark_price": _to_num(d.get("markPrice")),
+                "index_price": _to_num(d.get("indexPrice")),
+                "last_funding_rate": _to_num(d.get("lastFundingRate")),
+                "interest_rate": _to_num(d.get("interestRate")),
+                "next_funding_time": d.get("nextFundingTime")}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {px}）")}
+
+
+@_structured_errors
+def binance_futures_klines(symbol: str = "BTCUSDT", interval: str = "1d",
+                           limit: int = 120, proxy: str = "") -> dict:
+    """Binance 合约 K 线（fapi/v1/klines，免 key）。interval 见 _FUTURES_INTERVALS；
+    limit 1-1500。返回 ta 兼容的 klines: [{date,open,high,low,close,volume}]，
+    供 futures_indicators 直接喂 ta.compute。"""
+    sym = _check_futures_symbol(symbol)
+    interval = _check_choice(interval, _FUTURES_INTERVALS, "interval")
+    limit = _clamp_limit(limit, 1500)
+    px = proxy if proxy else PROXY
+    url = (f"{_BINANCE_KLINES}?symbol={sym}&interval={interval}&limit={limit}")
+    try:
+        st, b, ms = _http(url, proxy=px, headers=HERMES_UA)
+        raw = json.loads(b)
+        if not isinstance(raw, list):
+            return {"error": f"binance: {raw}", "http": st}
+        out = []
+        for k in raw:
+            if not isinstance(k, list) or len(k) < 6:
+                continue
+            out.append({"date": k[6] // 1000 if isinstance(k[6], int) else k[0],
+                        "open": _to_num(k[1]), "high": _to_num(k[2]),
+                        "low": _to_num(k[3]), "close": _to_num(k[4]),
+                        "volume": _to_num(k[5])})
+        return {"provider": "binance", "symbol": sym, "interval": interval,
+                "http": st, "ms": ms, "count": len(out), "klines": out}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {px}）")}
+
+
+@_structured_errors
+def eastmoney_futures(secid: str = "115.AU0", proxy: str = "") -> dict:
+    """东财商品/中国合约兜底行情（push2.eastmoney.com/api/qt/stock/get，免 key）。
+    secid: 115.SHFE(沪)/113.DCE(连)/114.CZCE(郑)/111.CFE(中金)，如 115.AU0(沪金主力)。
+    Binance 无该合约时用作补充，返回 name/price/change_pct。"""
+    s = _check_pattern(secid, r"^[0-9]{3}\.[A-Z0-9]{1,8}$", "secid")
+    px = proxy if proxy else ""
+    url = f"{_EM_FUTURES}?secid={s}"
+    try:
+        st, b, ms = _http(url, proxy=px or None, headers=HERMES_UA)
+        d = json.loads(b)
+        data = (d or {}).get("data")
+        if not data:
+            return {"error": f"eastmoney: no data for {s}", "http": st}
+        return {"provider": "eastmoney", "secid": s, "http": st, "ms": ms,
+                "name": data.get("name"), "code": data.get("code"),
+                "price": data.get("price"), "change_pct": data.get("pctChg"),
+                "open": data.get("open"), "high": data.get("high"),
+                "low": data.get("low"), "pre_close": data.get("preClose")}
+    except Exception as e:
+        return {"error": _err(e, f"（经代理 {px}）") if px else _err(e)}
+
+
+# ---------------- Bonds: U.S. Treasury par yield curve（免费无 key） ----------------
+# 补齐旧 quant 舰队缺失的债券类。财政部每日公布 3M→30Y 完整收益率曲线 CSV，
+# 免 key、含全部期限，可直接出 2s10s 利差/曲线形态——优于旧 FRED 仅限零星期限。
+# 走 home.treasury.gov：海外站点，国内 ECS 直连会超时，故默认经 PROXY（mihomo :7890）；
+# 传 proxy='' 可强制直连（境外部署环境）。
+
+_TREASURY_CSV = (
+    "https://home.treasury.gov/resource-center/data-chart-center/"
+    "interest-rates/daily-treasury-rates.csv/{year}/all"
+    "?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
+)
+_TENOR_LABELS = ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y"]
+_HEADER_TO_LABEL = {
+    "3 Mo": "3M", "6 Mo": "6M", "1 Yr": "1Y", "2 Yr": "2Y", "3 Yr": "3Y",
+    "5 Yr": "5Y", "7 Yr": "7Y", "10 Yr": "10Y", "20 Yr": "20Y", "30 Yr": "30Y",
+}
+
+
+def _parse_treasury_date(s):
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return s
+
+
+def _parse_treasury_rows(year, proxy=PROXY):
+    """拉取并解析财政部 CSV 为逐行 dict（已剔除空行/表头重复行）。
+
+    默认走 PROXY：home.treasury.gov 为海外站点，国内 ECS 直连会 read timeout。
+    """
+    from io import StringIO
+    import csv
+    text = _http(_TREASURY_CSV.format(year=year), proxy=proxy, headers=HERMES_UA)[1]
+    reader = csv.DictReader(StringIO(text.strip()))
+    rows = []
+    for row in reader:
+        if not row.get("Date"):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _row_to_curve(row):
+    curve = []
+    for header, label in _HEADER_TO_LABEL.items():
+        raw = (row.get(header) or "").strip()
+        if raw in ("", "N/A"):
+            continue
+        try:
+            curve.append({"tenor": label, "yield": float(raw)})
+        except ValueError:
+            continue
+    return curve
+
+
+@_structured_errors
+def treasury_curve(year: int = 0, proxy: str = "") -> dict:
+    """美国财政部每日收益率曲线（3M→30Y）。year=0 → 当年。
+    返回 curve[{tenor,yield}]、spread_2s10s、date、source。
+    proxy: 默认经 PROXY（mihomo）；传 'none' 强制直连；也可传自定义代理地址。"""
+    yr = year or datetime.now(timezone.utc).year
+    px = None if proxy == "none" else (proxy or PROXY)
+    try:
+        rows = _parse_treasury_rows(yr, px)
+    except Exception as e:
+        return {"error": _err(e), "source": "treasury.gov"}
+    if not rows:
+        return {"error": "treasury.gov no rows", "source": "treasury.gov"}
+    latest = rows[-1]
+    curve = _row_to_curve(latest)
+    by_label = {c["tenor"]: c["yield"] for c in curve}
+    y10, y2 = by_label.get("10Y"), by_label.get("2Y")
+    spread = round(y10 - y2, 4) if (y10 is not None and y2 is not None) else None
+    return {"provider": "treasury", "year": yr, "date": _parse_treasury_date(latest.get("Date", "")),
+            "curve": curve, "spread_2s10s": spread, "source": "treasury.gov"}
+
+
+@_structured_errors
+def treasury_yields(series: str = "DGS2,DGS10,DGS30,T10Y2Y", proxy: str = "") -> dict:
+    """FRED 形债券收益率聚合（全部由财政部曲线推导，免 key）。
+    series: 合成序列 id 子集，DGS2/DGS10/DGS30=期限收益率，T10Y2Y=2s10s 利差，
+    DGS10_HIST=10Y 历史（用于动量）。返回 latest + series{DGS10:{values,dates}}。
+    proxy: 同 treasury_curve。"""
+    yr = datetime.now(timezone.utc).year
+    px = None if proxy == "none" else (proxy or PROXY)
+    try:
+        rows = _parse_treasury_rows(yr, px)
+    except Exception as e:
+        return {"error": _err(e), "source": "treasury.gov"}
+    if not rows:
+        return {"error": "treasury.gov no rows", "source": "treasury.gov"}
+    chrono = rows[::-1]
+    hist = {lbl: [] for lbl in _TENOR_LABELS}
+    dates = []
+    for row in chrono:
+        by_label = {c["tenor"]: c["yield"] for c in _row_to_curve(row)}
+        for lbl in _TENOR_LABELS:
+            if lbl in by_label:
+                hist[lbl].append(by_label[lbl])
+        dates.append(_parse_treasury_date(row.get("Date", "")))
+    latest = rows[-1]
+    by_label = {c["tenor"]: c["yield"] for c in _row_to_curve(latest)}
+    y10, y2 = by_label.get("10Y"), by_label.get("2Y")
+    wanted = [s.strip().upper() for s in str(series).split(",") if s.strip()]
+    latest_out = {}
+    if "DGS2" in wanted:
+        latest_out["DGS2"] = y2
+    if "DGS10" in wanted:
+        latest_out["DGS10"] = y10
+    if "DGS30" in wanted:
+        latest_out["DGS30"] = by_label.get("30Y")
+    if "T10Y2Y" in wanted:
+        latest_out["T10Y2Y"] = round(y10 - y2, 4) if (y10 is not None and y2 is not None) else None
+    series_out = {}
+    if "DGS10_HIST" in wanted:
+        h = hist.get("10Y", [])
+        series_out["DGS10"] = {"ok": True, "label": "10Y",
+                               "latest": y10, "values": h,
+                               "dates": dates[-len(h):]}
+    return {"provider": "treasury", "date": _parse_treasury_date(latest.get("Date", "")),
+            "latest": latest_out, "series": series_out, "source": "treasury.gov"}
+
+
+# ---- 期货/债券缓存封装（复用 cache_get TTL 层）----
+def binance_futures_ticker_cached(symbol, ttl=None, proxy=""):
+    return cache_get(f"binance:ticker:{symbol}", _ttl(ttl, "binance"),
+                     binance_futures_ticker, symbol, proxy)
+
+
+def binance_futures_open_interest_cached(symbol, ttl=None, proxy=""):
+    return cache_get(f"binance:oi:{symbol}", _ttl(ttl, "binance"),
+                     binance_futures_open_interest, symbol, proxy)
+
+
+def binance_futures_premium_index_cached(symbol, ttl=None, proxy=""):
+    return cache_get(f"binance:premium:{symbol}", _ttl(ttl, "binance"),
+                     binance_futures_premium_index, symbol, proxy)
+
+
+def binance_futures_klines_cached(symbol, interval="1d", limit=120, ttl=None, proxy=""):
+    return cache_get(f"binance:klines:{symbol}:{interval}:{limit}", _ttl(ttl, "binance"),
+                     binance_futures_klines, symbol, interval, limit, proxy)
+
+
+def eastmoney_futures_cached(secid, ttl=None, proxy=""):
+    return cache_get(f"em:futures:{secid}", _ttl(ttl, "eastmoney"),
+                     eastmoney_futures, secid, proxy)
+
+
+def treasury_curve_cached(year=0, ttl=None, proxy=""):
+    return cache_get(f"treasury:curve:{year or 'now'}", _ttl(ttl, "treasury"),
+                     treasury_curve, year, proxy)
+
+
+def treasury_yields_cached(series="DGS2,DGS10,DGS30,T10Y2Y", ttl=None, proxy=""):
+    return cache_get(f"treasury:yields:{series}", _ttl(ttl, "treasury"),
+                     treasury_yields, series, proxy)
 
 
 # ---------------- CoinGecko 扩展（走 mihomo 代理） ----------------
@@ -1038,13 +1351,16 @@ _TTL_DEFAULTS = {
     "fred": 1800,          # 宏观序列 → 30min
     "akshare": 3600,       # 日频数据 → 1h
     "eastmoney": 600,      # 龙虎榜等报表（当日盘后更新）→ 10min
+    "binance": 30,         # 合约行情高频 → 30s
+    "treasury": 1800,      # 债券曲线日频 → 30min
 }
 
 
 # 缓存键前缀 → provider（metrics per-provider 缓存口径）。
 # fx:* 是 alpha_vantage 的汇率限频保护缓存，归 alpha_vantage。
 _CACHE_KEY_PROV = {"tushare": "tushare", "av": "alpha_vantage", "fx": "alpha_vantage",
-                   "fred": "fred", "akshare": "akshare", "em": "eastmoney"}
+                   "fred": "fred", "akshare": "akshare", "em": "eastmoney",
+                   "binance": "binance", "treasury": "treasury"}
 
 
 def _cache_observe(key, hit):
@@ -1500,6 +1816,17 @@ _PROVIDER_CATALOG = [
      "desc": "Alltick 实时行情（加密/美股）",
      "auth": "token（当前失效待重签）", "reachable": "token",
      "tools": "（alt 仓）", "quant_call": False},
+    {"provider": "binance", "endpoints": "ticker/24hr / openInterest / klines / premiumIndex",
+     "desc": "Binance USDⓈ-M 合约（期货第四类资产，免 key，补齐旧舰队缺口）",
+     "auth": "无（免费档）", "reachable": "proxy",
+     "tools": "get_futures_ticker / get_futures_open_interest / get_futures_kline / "
+              "futures_indicators / futures_volume_profile（quant 仓）",
+     "quant_call": False},
+    {"provider": "treasury", "endpoints": "daily_treasury_yield_curve CSV（3M→30Y）",
+     "desc": "美国财政部每日收益率曲线（债券类，免 key，含全部期限；优于 FRED 零星期限）",
+     "auth": "无（免费无 key）", "reachable": "yes",
+     "tools": "get_treasury_curve / get_treasury_yields / bond_indicators（macro 仓）",
+     "quant_call": False},
 ]
 
 
