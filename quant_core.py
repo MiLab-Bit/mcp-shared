@@ -689,14 +689,21 @@ def _parse_treasury_date(s):
         return s
 
 
-def _parse_treasury_rows(year, proxy=PROXY):
+# 财政部 CSV 实测经代理需 20–30s（该站点本身就是慢源），默认 15s 必然 read timeout。
+# 单独放宽；配合 30 分钟缓存，用户侧实际感知可接受。
+_TREASURY_TIMEOUT = 45
+
+
+def _parse_treasury_rows(year, proxy=PROXY, timeout=_TREASURY_TIMEOUT):
     """拉取并解析财政部 CSV 为逐行 dict（已剔除空行/表头重复行）。
 
     默认走 PROXY：home.treasury.gov 为海外站点，国内 ECS 直连会 read timeout。
+    timeout 单独放宽：实测该源经代理响应需 20–30s，超过 _http 默认 15s。
     """
     from io import StringIO
     import csv
-    text = _http(_TREASURY_CSV.format(year=year), proxy=proxy, headers=HERMES_UA)[1]
+    text = _http(_TREASURY_CSV.format(year=year), proxy=proxy,
+                 headers=HERMES_UA, timeout=timeout)[1]
     reader = csv.DictReader(StringIO(text.strip()))
     rows = []
     for row in reader:
@@ -720,19 +727,22 @@ def _row_to_curve(row):
 
 
 @_structured_errors
-def treasury_curve(year: int = 0, proxy: str = "") -> dict:
+def treasury_curve(year: int = 0, proxy: str = "", timeout: int = 0) -> dict:
     """美国财政部每日收益率曲线（3M→30Y）。year=0 → 当年。
     返回 curve[{tenor,yield}]、spread_2s10s、date、source。
-    proxy: 默认经 PROXY（mihomo）；传 'none' 强制直连；也可传自定义代理地址。"""
+    proxy: 默认经 PROXY（mihomo）；传 'none' 强制直连；也可传自定义代理地址。
+    timeout: 覆盖 _TREASURY_TIMEOUT（该源慢，默认放宽到 45s）。"""
     yr = year or datetime.now(timezone.utc).year
     px = None if proxy == "none" else (proxy or PROXY)
     try:
-        rows = _parse_treasury_rows(yr, px)
+        rows = _parse_treasury_rows(yr, px, timeout or _TREASURY_TIMEOUT)
     except Exception as e:
         return {"error": _err(e), "source": "treasury.gov"}
     if not rows:
         return {"error": "treasury.gov no rows", "source": "treasury.gov"}
-    latest = rows[-1]
+    # 财政部 CSV 是「最新在前」倒序排列（10/28 在首行，01/02 在末行），
+    # 因此最新曲线取 rows[0]；treasury_yields 里的 rows[::-1] 才是转成正序。
+    latest = rows[0]
     curve = _row_to_curve(latest)
     by_label = {c["tenor"]: c["yield"] for c in curve}
     y10, y2 = by_label.get("10Y"), by_label.get("2Y")
@@ -742,20 +752,21 @@ def treasury_curve(year: int = 0, proxy: str = "") -> dict:
 
 
 @_structured_errors
-def treasury_yields(series: str = "DGS2,DGS10,DGS30,T10Y2Y", proxy: str = "") -> dict:
+def treasury_yields(series: str = "DGS2,DGS10,DGS30,T10Y2Y", proxy: str = "",
+                    timeout: int = 0) -> dict:
     """FRED 形债券收益率聚合（全部由财政部曲线推导，免 key）。
     series: 合成序列 id 子集，DGS2/DGS10/DGS30=期限收益率，T10Y2Y=2s10s 利差，
     DGS10_HIST=10Y 历史（用于动量）。返回 latest + series{DGS10:{values,dates}}。
-    proxy: 同 treasury_curve。"""
+    proxy/timeout: 同 treasury_curve。"""
     yr = datetime.now(timezone.utc).year
     px = None if proxy == "none" else (proxy or PROXY)
     try:
-        rows = _parse_treasury_rows(yr, px)
+        rows = _parse_treasury_rows(yr, px, timeout or _TREASURY_TIMEOUT)
     except Exception as e:
         return {"error": _err(e), "source": "treasury.gov"}
     if not rows:
         return {"error": "treasury.gov no rows", "source": "treasury.gov"}
-    chrono = rows[::-1]
+    chrono = rows[::-1]          # 倒序(最新在前) → 正序(用于历史序列)
     hist = {lbl: [] for lbl in _TENOR_LABELS}
     dates = []
     for row in chrono:
@@ -764,7 +775,8 @@ def treasury_yields(series: str = "DGS2,DGS10,DGS30,T10Y2Y", proxy: str = "") ->
             if lbl in by_label:
                 hist[lbl].append(by_label[lbl])
         dates.append(_parse_treasury_date(row.get("Date", "")))
-    latest = rows[-1]
+    # 最新一行：CSV 首行（chrono 正序后为末行）
+    latest = chrono[-1]
     by_label = {c["tenor"]: c["yield"] for c in _row_to_curve(latest)}
     y10, y2 = by_label.get("10Y"), by_label.get("2Y")
     wanted = [s.strip().upper() for s in str(series).split(",") if s.strip()]
@@ -813,14 +825,15 @@ def eastmoney_futures_cached(secid, ttl=None, proxy=""):
                      eastmoney_futures, secid, proxy)
 
 
-def treasury_curve_cached(year=0, ttl=None, proxy=""):
+def treasury_curve_cached(year=0, ttl=None, proxy="", timeout=0):
     return cache_get(f"treasury:curve:{year or 'now'}", _ttl(ttl, "treasury"),
-                     treasury_curve, year, proxy)
+                     treasury_curve, year, proxy, timeout)
 
 
-def treasury_yields_cached(series="DGS2,DGS10,DGS30,T10Y2Y", ttl=None, proxy=""):
+def treasury_yields_cached(series="DGS2,DGS10,DGS30,T10Y2Y", ttl=None, proxy="",
+                           timeout=0):
     return cache_get(f"treasury:yields:{series}", _ttl(ttl, "treasury"),
-                     treasury_yields, series, proxy)
+                     treasury_yields, series, proxy, timeout)
 
 
 # ---------------- CoinGecko 扩展（走 mihomo 代理） ----------------

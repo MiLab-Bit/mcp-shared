@@ -1496,10 +1496,11 @@ def test_eastmoney_futures_empty_returns_error(monkeypatch):
 # ---------- 财政部收益率曲线（纯解析 + adapter） ----------
 
 def _fake_treasury_csv():
+    """贴合真实源：财政部 CSV 为「最新在前」倒序，首行是最新交易日。"""
     header = ("Date,3 Mo,6 Mo,1 Yr,2 Yr,3 Yr,5 Yr,7 Yr,10 Yr,20 Yr,30 Yr")
-    row1 = "11/03/2025,4.50,4.55,4.30,4.10,4.05,4.00,4.10,4.20,4.50,4.70"
-    row2 = "11/04/2025,4.51,4.56,4.31,4.12,4.07,4.02,4.12,4.25,4.55,4.72"
-    return "\n".join([header, row1, row2])
+    latest = "11/04/2025,4.51,4.56,4.31,4.12,4.07,4.02,4.12,4.25,4.55,4.72"
+    older = "11/03/2025,4.50,4.55,4.30,4.10,4.05,4.00,4.10,4.20,4.50,4.70"
+    return "\n".join([header, latest, older])
 
 
 def test_treasury_date_and_curve_parse():
@@ -1517,7 +1518,7 @@ def test_treasury_date_and_curve_parse():
 def test_treasury_curve_parses(monkeypatch):
     monkeypatch.setattr(core, "_http", lambda *a, **k: (200, _fake_treasury_csv(), 20))
     out = core.treasury_curve(2025)
-    assert out["date"] == "2025-11-04"  # 末行
+    assert out["date"] == "2025-11-04"  # 首行＝最新交易日（CSV 倒序）
     by_label = {c["tenor"]: c["yield"] for c in out["curve"]}
     assert by_label["10Y"] == 4.25 and by_label["2Y"] == 4.12
     assert out["spread_2s10s"] == round(4.25 - 4.12, 4)
@@ -1601,7 +1602,7 @@ def test_binance_futures_klines_cached_hit(monkeypatch):
 def test_treasury_curve_cached_hit(monkeypatch):
     core.cache_clear()
     calls = {"n": 0}
-    def fake(year=0, proxy=""):
+    def fake(year=0, proxy="", timeout=0):
         calls["n"] += 1
         return {"provider": "treasury", "curve": []}
     monkeypatch.setattr(core, "treasury_curve", fake)
